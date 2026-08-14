@@ -789,3 +789,45 @@ Next validation:
 4. run deterministic C32 through region CAPS;
 5. confirm the region backend now reaches Asset Core on 8110 and compare
    latency/throughput against the Stage-4.1 baseline.
+
+## R1 Asset Service Split – Phase B
+
+Status: **DEV VALIDATED**
+
+Date: 2026-08-14
+
+Goal:
+
+- make the dedicated Asset Core the only OpenSim AssetService instance that
+  owns/opens the asset database;
+- keep public HG asset compatibility through the existing Robust public port.
+
+DEV architecture after Phase B:
+
+- Region asset backend -> `http://127.0.0.1:8110`;
+- Asset Core -> `novalyth_robust_dev.assets`;
+- main Robust normal private `AssetServiceConnector` on 8103: disabled;
+- main Robust `[AssetService] LocalServiceModule`: disabled;
+- main Robust `[AssetService] AssetServerURI`: `http://127.0.0.1:8110`;
+- `[HGAssetService] BackingService`:
+  `OpenSim.Services.Connectors.dll:AssetServicesConnector`;
+- `[GridService] AssetService`:
+  `OpenSim.Services.Connectors.dll:AssetServicesConnector`;
+- public `HGAssetServiceConnector` remains on 8102 and fronts the remote
+  Asset Core through the HG permission/identifier wrapper;
+- LIVE `/nvme/opensim` unchanged.
+
+Validation:
+
+- known texture `01060176-57ff-4df0-8885-035c15895efa` direct Asset Core bytes: 32443;
+- public HG endpoint `8102/assets/<uuid>/data`: HTTP 200, exact same byte count;
+- private main-Robust endpoint `8103/assets/<uuid>/data`: HTTP 404;
+- startup log confirms HGAssetService remote backing connector;
+- startup log contains no new local AssetService enable marker and no normal
+  AssetServiceConnector load on 8103;
+- DEV region restarted against the Phase-B topology.
+
+Deferred:
+
+- Stage-2 `caps pending` and fair-queue wait telemetry cleanup is recorded as a
+  metrics TODO and is not a blocker for the service split.
