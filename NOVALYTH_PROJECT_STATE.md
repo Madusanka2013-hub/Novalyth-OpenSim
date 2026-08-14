@@ -220,26 +220,44 @@ Die isolierte Novalyth-Dev-Runtime ist eingerichtet:
   **nicht aktiv**. Die aktiven ConnectionStrings zeigen ausschließlich auf
   `novalyth_robust_dev` bzw. `novalyth_region_dev`.
 
+## ROBUST BASELINE STATUS
+
+**Robust-Baseline erfolgreich gestartet und geprüft (2026-08-14).**
+
+- Prozess läuft als Dev-Runtime aus `/nvme/novalyth-opensim-dev/bin`.
+- OpenSim/Robust-Version: `OpenSim 0.9.3.1 Nessie Dev`.
+- Aktive Hypergrid-Werte:
+  - `HomeURI = "${Const|BaseURL}:${Const|PublicPort}"`
+  - `GatekeeperURI = "${Const|BaseURL}:${Const|PublicPort}"`
+- Robust Public: `8102`
+- Robust Private: `8103`
+- Beide Robust-Listener binden aktuell auf `0.0.0.0`.
+- **Sicherheitsregel: Port 8103 niemals öffentlich in der Firewall freigeben.**
+- `novalyth_robust_dev` wurde erfolgreich migriert.
+- Gatekeeper, UserAgent, HGFriends, HG Inventory und HG Asset wurden im aktuellen Start erfolgreich geladen.
+- Der erste Startfehler durch fehlende `HomeURI`/`GatekeeperURI` wurde ausschließlich in der Dev-Runtime-Konfiguration korrigiert.
+- LIVE `/nvme/opensim` blieb unverändert.
+
 ## 8. CURRENT NEXT ACTION
 
-**Ersten isolierten Baseline-Start kontrolliert durchführen.**
+**Region-Baseline kontrolliert starten.**
 
-1. `novalyth-dev-status`
-2. Robust im Vordergrund starten: `novalyth-dev-robust`
-3. In einer zweiten Shell sofort prüfen:
-   `ss -ltnp | grep -E ':(8102|8103)'`
-4. Prüfen, welche Adressen Robust tatsächlich bindet.
-5. Prüfen, ob ausschließlich `novalyth_robust_dev` migriert/verwendet wird.
-6. Falls Netzwerk oder DB nicht sauber sind: Robust beenden und erst korrigieren.
-7. Wenn Robust sauber läuft, Region im Vordergrund starten:
-   `novalyth-dev-region`
-8. Eventuelle Estate-/Owner-Erstinitialisierung bewusst beantworten.
-9. Prüfen:
-   - Region-Port `9100`
+1. Robust weiterlaufen lassen.
+2. In einer zweiten SSH-Session `novalyth-dev-region` starten.
+3. Eventuelle Estate-/Owner-Erstinitialisierung bewusst beantworten.
+4. Prüfen:
+   - CWD `/nvme/novalyth-opensim-dev/bin`
+   - Region `Novalyth Dev Lab`
    - Grid-Position `1100,1100`
-   - ausschließlich `novalyth_region_dev`
-10. Baseline-Start/Logs messen und dokumentieren.
-11. Erst danach **PERFORMANCE R1 – Asset Pipeline** beginnen.
+   - Port `9100`
+   - ausschließlich DB `novalyth_region_dev`
+5. In weiterer Shell:
+   - `ss -lunp | grep -E ':(9100)'`
+   - `ss -ltnp | grep -E ':(9100)'`
+6. Region-Log auf `ERROR|Exception|Failed|Fatal` prüfen.
+7. Erst wenn Robust + Region sauber laufen, Firewall-/öffentlichen DEV-Viewer-Zugang planen.
+8. Port `8103` bleibt dauerhaft privat.
+9. Danach Baseline-Messungen erfassen und anschließend **PERFORMANCE R1 – Asset Pipeline** beginnen.
 
 ## 9. Pflegepflicht
 
@@ -258,3 +276,8 @@ Diese Datei muss den Zustand wiedergeben, den ein neuer Chat tatsächlich vorfin
 ## INFRASTRUKTUR-ÄNDERUNG 2026-08-14 – PHASE 2
 
 - Phase 2 abgeschlossen: isolierte Dev-Runtime, getrennte Robust-/Region-DBs, dedizierte Ports und Testregion vorbereitet; erster kontrollierter Baseline-Start steht aus.
+
+
+## BASELINE-MEILENSTEIN 2026-08-14 – ROBUST
+
+- Robust-Dev-Baseline erfolgreich validiert; HG-Dienste laden fehlerfrei, Listener 8102/8103 binden auf 0.0.0.0; 8103 bleibt strikt privat.
