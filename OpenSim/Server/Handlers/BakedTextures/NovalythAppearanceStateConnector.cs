@@ -15,9 +15,11 @@ using System.Linq;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using log4net;
 using Nini.Config;
 using OpenMetaverse;
+using OpenMetaverse.Assets;
 using OpenMetaverse.Imaging;
 using OpenMetaverse.StructuredData;
 using OpenSim.Framework;
@@ -197,6 +199,44 @@ namespace Novalyth.Server.Appearance
         private const int MaxWearableParameters = 4096;
         private const int MaxWearableTextures = 64;
 
+        // C2B1 intentionally keeps bake execution bounded. The service is
+        // internal-only until C3, but parallel login/outfit changes must still
+        // not turn 2K compositing into an unbounded memory spike.
+        private static readonly SemaphoreSlim s_bakeConcurrency = new(2, 2);
+
+        // Direct RGB visual-param triplets for local textures whose tint is
+        // channel-specific. This is especially important for Universal
+        // wearables: one Universal asset can carry different colors for head,
+        // upper, lower, skirt, hair, eyes and all five auxiliary bakes.
+        private static readonly IReadOnlyDictionary<int, int[]> s_textureRgbParams =
+            new Dictionary<int, int[]>
+            {
+                [1] = new[] { 803, 804, 805 },       // shirt
+                [2] = new[] { 806, 807, 808 },       // pants
+                [7] = new[] { 812, 813, 817 },       // shoes
+                [12] = new[] { 818, 819, 820 },      // socks
+                [13] = new[] { 831, 832, 833 },      // jacket upper
+                [14] = new[] { 809, 810, 811 },      // jacket lower
+                [15] = new[] { 827, 829, 830 },      // gloves
+                [16] = new[] { 821, 822, 823 },      // undershirt
+                [17] = new[] { 824, 825, 826 },      // underpants
+                [18] = new[] { 921, 922, 923 },      // skirt
+                [26] = new[] { 1062, 1063, 1064 },   // head tattoo
+                [27] = new[] { 1065, 1066, 1067 },   // upper tattoo
+                [28] = new[] { 1068, 1069, 1070 },   // lower tattoo
+                [29] = new[] { 1229, 1230, 1231 },   // head universal
+                [30] = new[] { 1232, 1233, 1234 },   // upper universal
+                [31] = new[] { 1235, 1236, 1237 },   // lower universal
+                [32] = new[] { 1208, 1209, 1210 },   // skirt universal
+                [33] = new[] { 1211, 1212, 1213 },   // hair universal
+                [34] = new[] { 924, 925, 926 },      // eyes universal
+                [35] = new[] { 1214, 1215, 1216 },   // left arm universal
+                [36] = new[] { 1217, 1218, 1219 },   // left leg universal
+                [37] = new[] { 1220, 1221, 1222 },   // aux1 universal
+                [38] = new[] { 1223, 1224, 1225 },   // aux2 universal
+                [39] = new[] { 1226, 1227, 1228 }    // aux3 universal
+            };
+
         private readonly string m_stateDirectory;
         private readonly string m_manifestDirectory;
         private readonly byte[] m_token;
@@ -226,7 +266,7 @@ namespace Novalyth.Server.Appearance
             m_assets = assets;
 
             m_log.InfoFormat(
-                "[NOVALYTH APPEARANCE C2A]: wearable parser + source graph online; contract={0}; bake-ready={1}",
+                "[NOVALYTH APPEARANCE C2B1]: 11-slot compositor foundation + J2K Asset Core store online; contract={0}; bake-ready={1}",
                 m_bakeContractVersion,
                 m_bakeReady);
         }
@@ -251,7 +291,7 @@ namespace Novalyth.Server.Appearance
                 OSDMap health = new();
                 health["status"] = "ok";
                 health["service"] = "Novalyth Appearance Core";
-                health["phase"] = "C2A";
+                health["phase"] = "C2B1";
                 health["sl_ssa_protocol_surface"] = true;
                 health["authoritative_cof"] = "Inventory Core";
                 health["bake_contract_version"] = m_bakeContractVersion;
@@ -259,8 +299,11 @@ namespace Novalyth.Server.Appearance
                 health["wearable_asset_parser"] = true;
                 health["source_texture_graph"] = true;
                 health["source_j2k_decode_audit"] = true;
-                health["pixel_compositor"] = false;
-                health["bake_asset_store"] = false;
+                health["pixel_compositor"] = true;
+                health["compositor_profile"] = "novalyth-c2b1-modern-foundation-v1";
+                health["bake_asset_store"] = true;
+                health["bake_asset_authority"] = "Asset Core";
+                health["central_bake_advertised"] = false;
                 health["server_bake_ready"] = m_bakeReady;
                 WriteMap(httpResponse, HttpStatusCode.OK, health);
                 return;
@@ -309,6 +352,14 @@ namespace Novalyth.Server.Appearance
                     if (httpRequest.HttpMethod == "GET")
                     {
                         HandleSourceAudit(agentID, httpResponse);
+                        return;
+                    }
+                    break;
+
+                case "bake":
+                    if (httpRequest.HttpMethod == "POST")
+                    {
+                        HandleBakeBuild(agentID, httpResponse);
                         return;
                     }
                     break;
@@ -388,7 +439,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C2A]: state read failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B1]: state read failed for {0}: {1}",
                     agentID,
                     e.Message);
             }
@@ -433,7 +484,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C2A]: manifest read failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B1]: manifest read failed for {0}: {1}",
                     agentID,
                     e.Message);
                 return null;
@@ -449,7 +500,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C2A]: Inventory Core COF lookup failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B1]: Inventory Core COF lookup failed for {0}: {1}",
                     agentID,
                     e.Message);
                 return null;
@@ -557,6 +608,1103 @@ namespace Novalyth.Server.Appearance
             }
         }
 
+
+        private void HandleBakeBuild(UUID agentID, IOSHttpResponse response)
+        {
+            lock (GetAgentLock(agentID))
+            {
+                if (!s_bakeConcurrency.Wait(TimeSpan.FromSeconds(120)))
+                {
+                    OSDMap busy = new();
+                    busy["success"] = false;
+                    busy["error"] = "bake_capacity_timeout";
+                    WriteMap(response, HttpStatusCode.ServiceUnavailable, busy);
+                    return;
+                }
+
+                try
+                {
+                    OSDMap previous = LoadManifest(agentID);
+
+                    if (!TryBuildAndPersistRecipe(
+                            agentID,
+                            out OSDMap manifest,
+                            out string recipeError))
+                    {
+                        OSDMap fail = new();
+                        fail["success"] = false;
+                        fail["error"] = recipeError;
+                        WriteMap(response, HttpStatusCode.OK, fail);
+                        return;
+                    }
+
+                    AuditSourceTextures(manifest);
+
+                    if (manifest["status"].AsString() != "source_decode_ready")
+                    {
+                        SaveManifest(agentID, manifest);
+
+                        OSDMap fail = new();
+                        fail["success"] = false;
+                        fail["error"] = "source_decode_not_ready";
+                        fail["manifest_status"] = manifest["status"].AsString();
+                        fail["source_audit_status"] =
+                            manifest["source_audit_status"].AsString();
+                        WriteMap(response, HttpStatusCode.OK, fail);
+                        return;
+                    }
+
+                    if (TryReuseStoredBakes(previous, manifest))
+                    {
+                        SaveManifest(agentID, manifest);
+                        UpdateStateFromManifest(agentID, manifest);
+                        manifest["success"] = true;
+                        manifest["bake_reused"] = true;
+                        WriteMap(response, HttpStatusCode.OK, manifest);
+                        return;
+                    }
+
+                    if (!TryCompositeAndStoreBakes(
+                            agentID,
+                            manifest,
+                            out string bakeError))
+                    {
+                        manifest["status"] = "c2b1_bake_failed";
+                        manifest["pixel_compositor_status"] = "failed";
+                        manifest["bake_error"] = bakeError ?? string.Empty;
+                        SaveManifest(agentID, manifest);
+                        UpdateStateFromManifest(agentID, manifest);
+
+                        OSDMap fail = new();
+                        fail["success"] = false;
+                        fail["error"] = bakeError ?? "c2b1_bake_failed";
+                        fail["recipe_hash"] = manifest["recipe_hash"].AsString();
+                        WriteMap(response, HttpStatusCode.OK, fail);
+                        return;
+                    }
+
+                    SaveManifest(agentID, manifest);
+                    UpdateStateFromManifest(agentID, manifest);
+
+                    manifest["success"] = true;
+                    manifest["bake_reused"] = false;
+                    WriteMap(response, HttpStatusCode.OK, manifest);
+                }
+                finally
+                {
+                    s_bakeConcurrency.Release();
+                }
+            }
+        }
+
+        private void UpdateStateFromManifest(UUID agentID, OSDMap manifest)
+        {
+            AppearanceState state = LoadState(agentID);
+            state.CofVersion = manifest["cof_version"].AsInteger();
+            state.RecipeCofVersion = manifest["cof_version"].AsInteger();
+            state.RecipeHash = manifest["recipe_hash"].AsString();
+            state.ManifestStatus = manifest["status"].AsString();
+            state.UpdatedUtc = DateTime.UtcNow.ToString("O");
+            SaveState(agentID, state);
+        }
+
+        private bool TryReuseStoredBakes(OSDMap previous, OSDMap current)
+        {
+            if (previous == null)
+                return false;
+
+            if (!previous.TryGetValue("recipe_hash", out OSD previousHash) ||
+                previousHash.AsString() != current["recipe_hash"].AsString())
+            {
+                return false;
+            }
+
+            if (!previous.TryGetValue("bakes", out OSD previousBakesOSD) ||
+                previousBakesOSD is not OSDArray previousBakes ||
+                previousBakes.Count != s_bakeDefinitions.Length)
+            {
+                return false;
+            }
+
+            foreach (OSD entry in previousBakes)
+            {
+                if (entry is not OSDMap bake ||
+                    bake["status"].AsString() != "j2k_stored" ||
+                    !UUID.TryParse(bake["asset_id"].AsString(), out UUID assetID) ||
+                    assetID.IsZero())
+                {
+                    return false;
+                }
+
+                try
+                {
+                    if (m_assets.GetMetadata(assetID.ToString()) == null)
+                        return false;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            current["bakes"] = previousBakes;
+            current["pixel_compositor_status"] =
+                previous["pixel_compositor_status"].AsString();
+            current["compositor_profile"] =
+                previous["compositor_profile"].AsString();
+            current["bake_asset_store_status"] = "asset_core_ready";
+            current["bake_asset_authority"] = "Asset Core";
+            current["bake_generated_utc"] =
+                previous["bake_generated_utc"].AsString();
+            current["status"] = "c2b1_bakes_ready_not_advertised";
+            return true;
+        }
+
+        private bool TryCompositeAndStoreBakes(
+            UUID agentID,
+            OSDMap manifest,
+            out string error)
+        {
+            error = string.Empty;
+
+            if (!TryBuildBakeLayerInputs(
+                    manifest,
+                    out Dictionary<string, List<BakeLayerInput>> layersByBake,
+                    out List<string> inputErrors))
+            {
+                error = inputErrors.Count > 0
+                    ? string.Join(",", inputErrors)
+                    : "bake_input_build_failed";
+                return false;
+            }
+
+            if (!manifest.TryGetValue("bakes", out OSD bakesOSD) ||
+                bakesOSD is not OSDArray bakes)
+            {
+                error = "manifest_bakes_missing";
+                return false;
+            }
+
+            foreach (BakeDefinition bake in s_bakeDefinitions)
+            {
+                OSDMap bakeMap = FindBakeMap(bakes, bake.Name);
+                if (bakeMap == null)
+                {
+                    error = "manifest_bake_slot_missing:" + bake.Name;
+                    return false;
+                }
+
+                List<BakeLayerInput> layers =
+                    layersByBake.TryGetValue(bake.Name, out List<BakeLayerInput> found)
+                        ? found
+                        : new List<BakeLayerInput>();
+
+                if (!TryCompositeBake(
+                        bake,
+                        layers,
+                        out byte[] encoded,
+                        out int width,
+                        out int height,
+                        out string compositeError))
+                {
+                    bakeMap["status"] = "compositor_failed";
+                    bakeMap["error"] = compositeError ?? string.Empty;
+                    error = bake.Name + ":" + compositeError;
+                    return false;
+                }
+
+                string j2kHash =
+                    Convert.ToHexString(SHA256.HashData(encoded)).ToLowerInvariant();
+                UUID assetID = DeterministicBakeAssetID(
+                    manifest["recipe_hash"].AsString(),
+                    bake.Name,
+                    j2kHash);
+
+                bool exists = false;
+                try
+                {
+                    exists = m_assets.GetMetadata(assetID.ToString()) != null;
+                }
+                catch
+                {
+                    exists = false;
+                }
+
+                if (!exists)
+                {
+                    AssetBase asset = new(
+                        assetID,
+                        "Novalyth SSA " + bake.Name,
+                        (sbyte)AssetType.Texture,
+                        agentID.ToString())
+                    {
+                        Data = encoded,
+                        Description = "Novalyth C2B1 " + bake.Name,
+                        Local = false,
+                        Temporary = false,
+                        Flags = AssetFlags.Normal
+                    };
+
+                    string stored;
+                    try
+                    {
+                        stored = m_assets.Store(asset);
+                    }
+                    catch (Exception e)
+                    {
+                        m_log.ErrorFormat(
+                            "[NOVALYTH APPEARANCE C2B1]: bake asset store failed {0}/{1}: {2}",
+                            agentID,
+                            bake.Name,
+                            e.Message);
+                        stored = string.Empty;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(stored))
+                    {
+                        error = bake.Name + ":asset_store_failed";
+                        bakeMap["status"] = "asset_store_failed";
+                        return false;
+                    }
+                }
+
+                bakeMap["status"] = "j2k_stored";
+                bakeMap["asset_id"] = assetID;
+                bakeMap["width"] = width;
+                bakeMap["height"] = height;
+                bakeMap["j2k_bytes"] = encoded.Length;
+                bakeMap["j2k_sha256"] = j2kHash;
+                bakeMap["compositor_profile"] =
+                    "novalyth-c2b1-modern-foundation-v1";
+                bakeMap["error"] = string.Empty;
+            }
+
+            manifest["pixel_compositor_status"] = "c2b1_ready";
+            manifest["compositor_profile"] =
+                "novalyth-c2b1-modern-foundation-v1";
+            manifest["compositor_semantics"] =
+                "modern_11_slot_source_layers_tint_param_masks_partial_static_layers";
+            manifest["bake_asset_store_status"] = "asset_core_ready";
+            manifest["bake_asset_authority"] = "Asset Core";
+            manifest["bake_generated_utc"] = DateTime.UtcNow.ToString("O");
+            manifest["central_bake_advertised"] = false;
+            manifest["status"] = "c2b1_bakes_ready_not_advertised";
+
+            return true;
+        }
+
+        private bool TryBuildBakeLayerInputs(
+            OSDMap manifest,
+            out Dictionary<string, List<BakeLayerInput>> layersByBake,
+            out List<string> errors)
+        {
+            layersByBake = new Dictionary<string, List<BakeLayerInput>>(
+                StringComparer.Ordinal);
+
+            foreach (BakeDefinition bake in s_bakeDefinitions)
+                layersByBake[bake.Name] = new List<BakeLayerInput>();
+
+            errors = new List<string>();
+
+            if (!manifest.TryGetValue("wearables", out OSD wearablesOSD) ||
+                wearablesOSD is not OSDArray wearables)
+            {
+                errors.Add("manifest_wearables_missing");
+                return false;
+            }
+
+            Dictionary<UUID, AssetTexture> decodedTextures = new();
+
+            foreach (OSD entry in wearables)
+            {
+                if (entry is not OSDMap wearableMap ||
+                    !UUID.TryParse(
+                        wearableMap["asset_id"].AsString(),
+                        out UUID wearableAssetID) ||
+                    wearableAssetID.IsZero())
+                {
+                    errors.Add("invalid_wearable_manifest_entry");
+                    continue;
+                }
+
+                int wearableType = wearableMap["wearable_type"].AsInteger();
+                string orderKey = wearableMap["order"].AsString();
+
+                AssetBase rawWearable;
+                try
+                {
+                    rawWearable = m_assets.Get(wearableAssetID.ToString());
+                }
+                catch
+                {
+                    rawWearable = null;
+                }
+
+                if (rawWearable?.Data == null)
+                {
+                    errors.Add(wearableAssetID + ":wearable_asset_missing");
+                    continue;
+                }
+
+                AssetWearable wearableAsset;
+
+                switch ((AssetType)rawWearable.Type)
+                {
+                    case AssetType.Bodypart:
+                        wearableAsset =
+                            new AssetBodypart(
+                                wearableAssetID,
+                                rawWearable.Data);
+                        break;
+
+                    case AssetType.Clothing:
+                        wearableAsset =
+                            new AssetClothing(
+                                wearableAssetID,
+                                rawWearable.Data);
+                        break;
+
+                    default:
+                        errors.Add(
+                            wearableAssetID +
+                            ":unsupported_wearable_asset_type:" +
+                            rawWearable.Type);
+                        continue;
+                }
+
+                if (!wearableAsset.Decode())
+                {
+                    errors.Add(wearableAssetID + ":wearable_decode_failed");
+                    continue;
+                }
+
+                AppearanceManager.TextureData[] temp =
+                    new AppearanceManager.TextureData[
+                        (int)AvatarTextureIndex.NumberOfEntries];
+
+                for (int i = 0; i < temp.Length; i++)
+                {
+                    temp[i].TextureIndex = (AvatarTextureIndex)i;
+                    temp[i].Color = Color4.White;
+                }
+
+                AppearanceManager.WearableData wearable =
+                    new()
+                    {
+                        ItemID = UUID.Zero,
+                        AssetID = wearableAssetID,
+                        WearableType = (WearableType)wearableType,
+                        AssetType = (AssetType)rawWearable.Type,
+                        Asset = wearableAsset
+                    };
+
+                try
+                {
+                    AppearanceManager.DecodeWearableParams(wearable, ref temp);
+                }
+                catch (Exception e)
+                {
+                    errors.Add(
+                        wearableAssetID + ":visual_param_decode:" +
+                        e.GetType().Name);
+                    continue;
+                }
+
+                foreach (KeyValuePair<AvatarTextureIndex, UUID> textureEntry
+                             in wearableAsset.Textures)
+                {
+                    int textureIndex = (int)textureEntry.Key;
+                    UUID textureID = textureEntry.Value;
+
+                    if (!s_sourceTextureBakeSlots.TryGetValue(
+                            textureIndex,
+                            out string bakeSlot) ||
+                        textureID.IsZero() ||
+                        textureID == AppearanceManager.DEFAULT_AVATAR_TEXTURE)
+                    {
+                        continue;
+                    }
+
+                    if (!decodedTextures.TryGetValue(
+                            textureID,
+                            out AssetTexture textureAsset))
+                    {
+                        AssetBase rawTexture;
+                        try
+                        {
+                            rawTexture = m_assets.Get(textureID.ToString());
+                        }
+                        catch
+                        {
+                            rawTexture = null;
+                        }
+
+                        if (rawTexture?.Data == null)
+                        {
+                            errors.Add(textureID + ":source_asset_missing");
+                            continue;
+                        }
+
+                        textureAsset = new AssetTexture(textureID, rawTexture.Data);
+                        if (!textureAsset.Decode() || textureAsset.Image == null)
+                        {
+                            errors.Add(textureID + ":source_j2k_decode_failed");
+                            continue;
+                        }
+
+                        decodedTextures[textureID] = textureAsset;
+                    }
+
+                    AppearanceManager.TextureData textureData = temp[textureIndex];
+                    textureData.TextureIndex = textureEntry.Key;
+                    textureData.TextureID = textureID;
+                    textureData.Texture = textureAsset;
+                    textureData.Color = ResolveLayerColor(
+                        wearableAsset,
+                        textureIndex,
+                        textureData.Color);
+
+                    layersByBake[bakeSlot].Add(
+                        new BakeLayerInput
+                        {
+                            BakeSlot = bakeSlot,
+                            TextureIndex = textureIndex,
+                            LayerOrder = GetLayerOrder(textureIndex),
+                            TextureID = textureID,
+                            WearableType = wearableType,
+                            WearableAssetID = wearableAssetID,
+                            OrderKey = orderKey ?? string.Empty,
+                            TextureData = textureData
+                        });
+                }
+            }
+
+            foreach (List<BakeLayerInput> layers in layersByBake.Values)
+                layers.Sort(BakeLayerInput.Compare);
+
+            return errors.Count == 0;
+        }
+
+        private static Color4 ResolveLayerColor(
+            AssetWearable wearable,
+            int textureIndex,
+            Color4 fallback)
+        {
+            if (!s_textureRgbParams.TryGetValue(
+                    textureIndex,
+                    out int[] ids) ||
+                ids.Length != 3)
+            {
+                return fallback;
+            }
+
+            if (!wearable.Params.TryGetValue(ids[0], out float r) ||
+                !wearable.Params.TryGetValue(ids[1], out float g) ||
+                !wearable.Params.TryGetValue(ids[2], out float b))
+            {
+                return fallback;
+            }
+
+            return new Color4(
+                Math.Clamp(r, 0f, 1f),
+                Math.Clamp(g, 0f, 1f),
+                Math.Clamp(b, 0f, 1f),
+                1f);
+        }
+
+        private bool TryCompositeBake(
+            BakeDefinition bake,
+            List<BakeLayerInput> layers,
+            out byte[] encoded,
+            out int width,
+            out int height,
+            out string error)
+        {
+            encoded = Array.Empty<byte>();
+            error = string.Empty;
+
+            width = bake.Name == "eyes" ? 512 : 2048;
+            height = width;
+
+            ManagedImage baked = new(
+                width,
+                height,
+                ManagedImage.ImageChannels.Color |
+                ManagedImage.ImageChannels.Alpha |
+                ManagedImage.ImageChannels.Bump);
+
+            InitializeBakeBase(bake.Name, baked, layers);
+
+            bool firstAlphaCarryingColorLayer = true;
+            List<BakeLayerInput> visibilityMasks = new();
+
+            foreach (BakeLayerInput layer in layers)
+            {
+                if (IsVisibilityTextureIndex(layer.TextureIndex))
+                {
+                    visibilityMasks.Add(layer);
+                    continue;
+                }
+
+                if (layer.TextureData.Texture?.Image == null)
+                    continue;
+
+                ManagedImage texture = layer.TextureData.Texture.Image.Clone();
+
+                if (texture.Width != width || texture.Height != height)
+                {
+                    try
+                    {
+                        texture.ResizeNearestNeighbor(width, height);
+                    }
+                    catch (Exception e)
+                    {
+                        error =
+                            "resize_failed:" + layer.TextureID + ":" +
+                            e.GetType().Name;
+                        return false;
+                    }
+                }
+
+                if (!IsBodypaintTextureIndex(layer.TextureIndex))
+                    ApplyTint(texture, layer.TextureData.Color);
+
+                ApplyParamMasks(
+                    texture,
+                    layer.TextureData.AlphaMasks,
+                    bake.Name);
+
+                bool keepSourceAlpha =
+                    firstAlphaCarryingColorLayer &&
+                    (bake.Name == "hair" || bake.Name == "skirt");
+
+                DrawLayer(baked, texture, keepSourceAlpha);
+                firstAlphaCarryingColorLayer = false;
+            }
+
+            foreach (BakeLayerInput mask in visibilityMasks)
+            {
+                ManagedImage source = mask.TextureData.Texture?.Image;
+                if (source == null)
+                    continue;
+
+                ManagedImage copy = source.Clone();
+                if (copy.Width != width || copy.Height != height)
+                {
+                    try
+                    {
+                        copy.ResizeNearestNeighbor(width, height);
+                    }
+                    catch
+                    {
+                        error = "visibility_mask_resize_failed:" + mask.TextureID;
+                        return false;
+                    }
+                }
+
+                AddAlpha(baked, copy);
+            }
+
+            try
+            {
+                encoded = OpenJPEG.Encode(baked, false);
+            }
+            catch (Exception e)
+            {
+                error = "j2k_encode_exception:" + e.GetType().Name;
+                return false;
+            }
+
+            if (encoded == null || encoded.Length == 0)
+            {
+                error = "j2k_encode_empty";
+                return false;
+            }
+
+            return true;
+        }
+
+        private void InitializeBakeBase(
+            string bakeSlot,
+            ManagedImage baked,
+            List<BakeLayerInput> layers)
+        {
+            Color4 initial = Color4.White;
+
+            if ((bakeSlot == "hair" || bakeSlot == "skirt") &&
+                layers.Count > 0)
+            {
+                initial = layers[0].TextureData.Color;
+            }
+            else if (bakeSlot == "leftarm" ||
+                     bakeSlot == "leftleg" ||
+                     bakeSlot == "aux1" ||
+                     bakeSlot == "aux2" ||
+                     bakeSlot == "aux3")
+            {
+                initial = new Color4(
+                    128f / 255f,
+                    128f / 255f,
+                    128f / 255f,
+                    1f);
+            }
+
+            FillDithered(baked, initial);
+
+            if (bakeSlot == "head")
+            {
+                ManagedImage headColor = LoadBakeResource("head_color.tga");
+                if (headColor != null)
+                    DrawLayer(baked, headColor, false);
+
+                ManagedImage headAlpha = LoadBakeResource("head_alpha.tga");
+                if (headAlpha != null)
+                    AddAlpha(baked, headAlpha);
+
+                ManagedImage skinGrain = LoadBakeResource("head_skingrain.tga");
+                if (skinGrain != null)
+                    MultiplyLayerFromAlpha(baked, skinGrain);
+            }
+            else if (bakeSlot == "upper" &&
+                     !layers.Any(x => x.TextureIndex == 5))
+            {
+                ManagedImage upper = LoadBakeResource("upperbody_color.tga");
+                if (upper != null)
+                    DrawLayer(baked, upper, false);
+            }
+            else if (bakeSlot == "lower" &&
+                     !layers.Any(x => x.TextureIndex == 6))
+            {
+                ManagedImage lower = LoadBakeResource("lowerbody_color.tga");
+                if (lower != null)
+                    DrawLayer(baked, lower, false);
+            }
+            else if (bakeSlot == "eyes")
+            {
+                ManagedImage eyeWhite = LoadBakeResource("eyewhite.tga");
+                if (eyeWhite != null)
+                    DrawLayer(baked, eyeWhite, false);
+            }
+        }
+
+        private static ManagedImage LoadBakeResource(string name)
+        {
+            try
+            {
+                return Baker.LoadResourceLayer(name);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool IsVisibilityTextureIndex(int textureIndex)
+        {
+            return textureIndex >= 21 && textureIndex <= 25;
+        }
+
+        private static bool IsBodypaintTextureIndex(int textureIndex)
+        {
+            return textureIndex == 0 ||
+                   textureIndex == 5 ||
+                   textureIndex == 6;
+        }
+
+        private static int GetLayerOrder(int textureIndex)
+        {
+            return textureIndex switch
+            {
+                // Base skin/body textures first.
+                0 => 100,
+                5 => 100,
+                6 => 100,
+                3 => 100,
+                4 => 100,
+                18 => 100,
+
+                // Tattoo / universal tattoo before clothing.
+                26 => 200,
+                27 => 200,
+                28 => 200,
+                29 => 210,
+                30 => 210,
+                31 => 210,
+                32 => 210,
+                33 => 210,
+                34 => 210,
+                35 => 210,
+                36 => 210,
+                37 => 210,
+                38 => 210,
+                39 => 210,
+
+                // Under-layers.
+                17 => 300,
+                16 => 300,
+                12 => 310,
+
+                // Shoes/gloves then primary clothing.
+                7 => 400,
+                15 => 400,
+                2 => 500,
+                1 => 500,
+
+                // Jacket is outermost classic clothing layer.
+                13 => 600,
+                14 => 600,
+
+                // Visibility masks are applied after all color layers.
+                21 => 1000,
+                22 => 1000,
+                23 => 1000,
+                24 => 1000,
+                25 => 1000,
+
+                _ => 700
+            };
+        }
+
+        private static bool MaskBelongsToBake(string bakeSlot, string mask)
+        {
+            if (string.IsNullOrEmpty(mask))
+                return false;
+
+            if (bakeSlot == "lower" &&
+                (mask.Contains("upper", StringComparison.OrdinalIgnoreCase) ||
+                 mask.Contains("shirt", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            if (bakeSlot == "upper" &&
+                mask.Contains("lower", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static void ApplyParamMasks(
+            ManagedImage texture,
+            Dictionary<VisualAlphaParam, float> masks,
+            string bakeSlot)
+        {
+            if (texture == null || masks == null || masks.Count == 0)
+                return;
+
+            ManagedImage combined = new(
+                texture.Width,
+                texture.Height,
+                ManagedImage.ImageChannels.Alpha);
+
+            int normalCount = 0;
+
+            foreach (KeyValuePair<VisualAlphaParam, float> kvp in masks)
+            {
+                if (!MaskBelongsToBake(bakeSlot, kvp.Key.TGAFile) ||
+                    kvp.Key.MultiplyBlend ||
+                    (kvp.Value <= 0f && kvp.Key.SkipIfZero))
+                {
+                    continue;
+                }
+
+                ApplyAlphaMask(combined, kvp.Key, kvp.Value);
+                normalCount++;
+            }
+
+            if (normalCount == 0 && combined.Alpha != null)
+                Array.Fill(combined.Alpha, byte.MaxValue);
+
+            foreach (KeyValuePair<VisualAlphaParam, float> kvp in masks)
+            {
+                if (!MaskBelongsToBake(bakeSlot, kvp.Key.TGAFile) ||
+                    !kvp.Key.MultiplyBlend ||
+                    (kvp.Value <= 0f && kvp.Key.SkipIfZero))
+                {
+                    continue;
+                }
+
+                ApplyAlphaMask(combined, kvp.Key, kvp.Value);
+            }
+
+            AddAlpha(texture, combined);
+        }
+
+        private static void ApplyAlphaMask(
+            ManagedImage dest,
+            VisualAlphaParam param,
+            float value)
+        {
+            ManagedImage src = LoadBakeResource(param.TGAFile);
+            if (dest?.Alpha == null || src?.Alpha == null)
+                return;
+
+            if (dest.Width != src.Width || dest.Height != src.Height)
+            {
+                try
+                {
+                    src.ResizeNearestNeighbor(dest.Width, dest.Height);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+
+            float clamped = Math.Clamp(value, 0f, 1f);
+            byte threshold = (byte)((1f - clamped) * 255f);
+
+            for (int i = 0; i < dest.Alpha.Length; i++)
+            {
+                byte alpha = src.Alpha[i] <= threshold
+                    ? (byte)0
+                    : byte.MaxValue;
+
+                if (param.MultiplyBlend)
+                {
+                    dest.Alpha[i] =
+                        (byte)((dest.Alpha[i] * alpha) >> 8);
+                }
+                else if (alpha > dest.Alpha[i])
+                {
+                    dest.Alpha[i] = alpha;
+                }
+            }
+        }
+
+        private static void ApplyTint(ManagedImage image, Color4 color)
+        {
+            if (image?.Red == null ||
+                image.Green == null ||
+                image.Blue == null)
+            {
+                return;
+            }
+
+            byte r = Utils.FloatZeroOneToByte(color.R);
+            byte g = Utils.FloatZeroOneToByte(color.G);
+            byte b = Utils.FloatZeroOneToByte(color.B);
+
+            for (int i = 0; i < image.Red.Length; i++)
+            {
+                image.Red[i] = (byte)((image.Red[i] * r) >> 8);
+                image.Green[i] = (byte)((image.Green[i] * g) >> 8);
+                image.Blue[i] = (byte)((image.Blue[i] * b) >> 8);
+            }
+        }
+
+        private static void AddAlpha(ManagedImage dest, ManagedImage src)
+        {
+            if (dest == null || src == null)
+                return;
+
+            if ((dest.Channels & ManagedImage.ImageChannels.Alpha) == 0)
+            {
+                dest.ConvertChannels(
+                    dest.Channels | ManagedImage.ImageChannels.Alpha);
+            }
+
+            if ((src.Channels & ManagedImage.ImageChannels.Alpha) == 0 ||
+                src.Alpha == null)
+            {
+                return;
+            }
+
+            if (dest.Width != src.Width || dest.Height != src.Height)
+            {
+                try
+                {
+                    src.ResizeNearestNeighbor(dest.Width, dest.Height);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+
+            for (int i = 0; i < dest.Alpha.Length; i++)
+            {
+                if (src.Alpha[i] < dest.Alpha[i])
+                    dest.Alpha[i] = src.Alpha[i];
+            }
+        }
+
+        private static void MultiplyLayerFromAlpha(
+            ManagedImage dest,
+            ManagedImage src)
+        {
+            if (dest?.Red == null || src?.Alpha == null)
+                return;
+
+            if (dest.Width != src.Width || dest.Height != src.Height)
+            {
+                try
+                {
+                    src.ResizeNearestNeighbor(dest.Width, dest.Height);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+
+            for (int i = 0; i < dest.Red.Length; i++)
+            {
+                dest.Red[i] = (byte)((dest.Red[i] * src.Alpha[i]) >> 8);
+                dest.Green[i] =
+                    (byte)((dest.Green[i] * src.Alpha[i]) >> 8);
+                dest.Blue[i] =
+                    (byte)((dest.Blue[i] * src.Alpha[i]) >> 8);
+            }
+        }
+
+        private static void DrawLayer(
+            ManagedImage dest,
+            ManagedImage source,
+            bool addSourceAlpha)
+        {
+            if (dest == null || source == null)
+                return;
+
+            if (dest.Width != source.Width ||
+                dest.Height != source.Height)
+            {
+                try
+                {
+                    source.ResizeNearestNeighbor(dest.Width, dest.Height);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+
+            bool hasColor =
+                (source.Channels & ManagedImage.ImageChannels.Color) != 0 &&
+                source.Red != null &&
+                source.Green != null &&
+                source.Blue != null;
+
+            bool hasAlpha =
+                (source.Channels & ManagedImage.ImageChannels.Alpha) != 0 &&
+                source.Alpha != null;
+
+            bool hasBump =
+                (source.Channels & ManagedImage.ImageChannels.Bump) != 0 &&
+                source.Bump != null;
+
+            for (int i = 0; i < dest.Red.Length; i++)
+            {
+                int alpha = hasAlpha ? source.Alpha[i] : 255;
+                int inverse = 255 - alpha;
+
+                if (hasColor)
+                {
+                    dest.Red[i] =
+                        (byte)((dest.Red[i] * inverse +
+                                source.Red[i] * alpha) >> 8);
+                    dest.Green[i] =
+                        (byte)((dest.Green[i] * inverse +
+                                source.Green[i] * alpha) >> 8);
+                    dest.Blue[i] =
+                        (byte)((dest.Blue[i] * inverse +
+                                source.Blue[i] * alpha) >> 8);
+                }
+
+                if (addSourceAlpha && hasAlpha &&
+                    source.Alpha[i] < dest.Alpha[i])
+                {
+                    dest.Alpha[i] = source.Alpha[i];
+                }
+
+                if (hasBump)
+                    dest.Bump[i] = source.Bump[i];
+            }
+        }
+
+        private static void FillDithered(
+            ManagedImage image,
+            Color4 color)
+        {
+            byte r = Utils.FloatZeroOneToByte(color.R);
+            byte g = Utils.FloatZeroOneToByte(color.G);
+            byte b = Utils.FloatZeroOneToByte(color.B);
+
+            byte rAlt = r < byte.MaxValue
+                ? (byte)(r + 1)
+                : (byte)(r - 1);
+            byte gAlt = g < byte.MaxValue
+                ? (byte)(g + 1)
+                : (byte)(g - 1);
+            byte bAlt = b < byte.MaxValue
+                ? (byte)(b + 1)
+                : (byte)(b - 1);
+
+            int i = 0;
+            for (int y = 0; y < image.Height; y++)
+            {
+                for (int x = 0; x < image.Width; x++)
+                {
+                    if (((x ^ y) & 0x10) == 0)
+                    {
+                        image.Red[i] = rAlt;
+                        image.Green[i] = g;
+                        image.Blue[i] = b;
+                    }
+                    else
+                    {
+                        image.Red[i] = r;
+                        image.Green[i] = gAlt;
+                        image.Blue[i] = bAlt;
+                    }
+
+                    image.Alpha[i] = byte.MaxValue;
+                    image.Bump[i] = 0;
+                    i++;
+                }
+            }
+        }
+
+        private static OSDMap FindBakeMap(OSDArray bakes, string name)
+        {
+            foreach (OSD entry in bakes)
+            {
+                if (entry is OSDMap map &&
+                    map["name"].AsString() == name)
+                {
+                    return map;
+                }
+            }
+
+            return null;
+        }
+
+        private static UUID DeterministicBakeAssetID(
+            string recipeHash,
+            string bakeSlot,
+            string j2kHash)
+        {
+            string canonical =
+                "novalyth-c2b1-bake-asset-v1|" +
+                recipeHash + "|" + bakeSlot + "|" + j2kHash;
+
+            string hex = Convert.ToHexString(
+                SHA256.HashData(Encoding.UTF8.GetBytes(canonical)))
+                .ToLowerInvariant();
+
+            string id =
+                hex.Substring(0, 8) + "-" +
+                hex.Substring(8, 4) + "-" +
+                hex.Substring(12, 4) + "-" +
+                hex.Substring(16, 4) + "-" +
+                hex.Substring(20, 12);
+
+            UUID.TryParse(id, out UUID uuid);
+            return uuid;
+        }
+
         private void HandleIncrement(UUID agentID, IOSHttpResponse response)
         {
             lock (GetAgentLock(agentID))
@@ -584,7 +1732,7 @@ namespace Novalyth.Server.Appearance
                 catch (Exception e)
                 {
                     m_log.ErrorFormat(
-                        "[NOVALYTH APPEARANCE C2A]: COF version increment failed for {0}: {1}",
+                        "[NOVALYTH APPEARANCE C2B1]: COF version increment failed for {0}: {1}",
                         agentID,
                         e.Message);
                     updated = false;
@@ -725,7 +1873,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C2A]: COF content lookup failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B1]: COF content lookup failed for {0}: {1}",
                     agentID,
                     e.Message);
                 error = "cof_read_failed";
@@ -800,7 +1948,7 @@ namespace Novalyth.Server.Appearance
                         catch (Exception e)
                         {
                             m_log.WarnFormat(
-                                "[NOVALYTH APPEARANCE C2A]: wearable asset fetch failed {0}: {1}",
+                                "[NOVALYTH APPEARANCE C2B1]: wearable asset fetch failed {0}: {1}",
                                 target.AssetID,
                                 e.Message);
                         }
@@ -937,7 +2085,11 @@ namespace Novalyth.Server.Appearance
             manifest["missing_source_assets"] = missingSourceArray;
             manifest["source_texture_count"] = sourceLayers.Count;
             manifest["source_audit_status"] = "not_run";
-            manifest["pixel_compositor_status"] = "not_implemented_c2a";
+            manifest["pixel_compositor_status"] = "c2b1_available_on_demand";
+            manifest["compositor_profile"] = "novalyth-c2b1-modern-foundation-v1";
+            manifest["bake_asset_store_status"] = "not_run";
+            manifest["bake_asset_authority"] = "Asset Core";
+            manifest["central_bake_advertised"] = false;
             manifest["bakes"] = bakes;
 
             if (brokenLinks.Count > 0 ||
@@ -1149,7 +2301,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.WarnFormat(
-                    "[NOVALYTH APPEARANCE C2A]: source texture decode failed {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B1]: source texture decode failed {0}: {1}",
                     textureID,
                     e.Message);
                 return SourceDecodeResult.Fail(e.GetType().Name);
@@ -1640,6 +2792,41 @@ namespace Novalyth.Server.Appearance
                 map["wearable_asset_id"] = WearableAssetID;
                 map["order"] = OrderKey ?? string.Empty;
                 return map;
+            }
+        }
+
+        private sealed class BakeLayerInput
+        {
+            public string BakeSlot = string.Empty;
+            public int TextureIndex;
+            public int LayerOrder;
+            public UUID TextureID;
+            public int WearableType;
+            public UUID WearableAssetID;
+            public string OrderKey = string.Empty;
+            public AppearanceManager.TextureData TextureData;
+
+            public static int Compare(BakeLayerInput a, BakeLayerInput b)
+            {
+                int c = a.LayerOrder.CompareTo(b.LayerOrder);
+                if (c != 0)
+                    return c;
+
+                c = string.Compare(
+                    a.OrderKey,
+                    b.OrderKey,
+                    StringComparison.Ordinal);
+                if (c != 0)
+                    return c;
+
+                c = a.WearableType.CompareTo(b.WearableType);
+                if (c != 0)
+                    return c;
+
+                return string.Compare(
+                    a.WearableAssetID.ToString(),
+                    b.WearableAssetID.ToString(),
+                    StringComparison.Ordinal);
             }
         }
 

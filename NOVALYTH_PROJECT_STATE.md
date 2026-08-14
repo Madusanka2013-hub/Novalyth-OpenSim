@@ -1401,3 +1401,40 @@ Viewer validation:
 - DEV Region, DEV Robust, Asset Core, Inventory Core and LIVE remain untouched.
 - C2B: SL/avatar_lad-compatible layer semantics + real compositor + J2K encode/store.
 - C3: real Firestorm SSA validation and only then CentralBakeVersion advertisement.
+
+## Appearance Core Phase C2B1 – 11-slot compositor foundation + J2K Asset Core store (20260814-133011)
+
+- Base commit: `808ae4a07ad600498e808db9e8711e4ce409846f`.
+- C2A real-avatar validation passed before this phase:
+  deterministic recipe, zero broken links, zero missing wearable/source assets,
+  zero wearable parse/type errors and all unique source J2Ks decoded.
+- Runtime audit confirmed OpenMetaverse 0.9.4 exposes all 11 modern bake enums,
+  `ManagedImage`, `AssetTexture.Encode()` and OpenJPEG encode/decode APIs.
+- The earlier C2B runtime resource failure was a probe EntryAssembly-path artifact;
+  the actual Appearance Core runtime owns `/nvme/novalyth-opensim-dev/bin/openmetaverse_data`.
+- C2B1 adds internal `POST /novalythappearance/bake/<agent>`.
+- Bake execution is bounded to two concurrent 2K compositors per Appearance Core process.
+- Multiple COF wearables are preserved as independent bake-layer inputs instead of
+  collapsing the outfit into the historical one-wearable-per-type dictionary.
+- All 11 `sl-current-11-v1` bake slots are generated on demand:
+  head, upper, lower, eyes, skirt, hair, leftarm, leftleg, aux1, aux2, aux3.
+- Current layer-set output size is 2048x2048, with eyes at 512x512.
+- Per-layer tint uses wearable visual parameters; Universal/tattoo and dual jacket
+  texture channels use texture-specific RGB triplets.
+- OpenMetaverse visual-param decoding supplies classic tint and alpha-mask/driver data.
+- Visibility alpha textures are applied after color compositing.
+- J2K output is encoded through the existing OpenMetaverse/OpenJPEG codec.
+- Baked texture asset IDs are deterministic from recipe hash + slot + J2K hash.
+- J2Ks are stored through the authoritative Asset Core :8110 `IAssetService.Store`.
+- Successful repeated requests with the same recipe reuse existing immutable bake assets.
+- C2B1 compositor profile is `novalyth-c2b1-modern-foundation-v1`.
+- C2B1 is intentionally marked as a foundation, not final SL pixel parity:
+  the complete static avatar_lad.xml makeup/detail layer interpreter remains required
+  before C3 can claim full Second Life server-side appearance parity.
+- The five auxiliary slots use the avatar_lad neutral fixed-color base internally;
+  C2B1 does not add an untracked external aux_base.tga dependency.
+- `CentralBakeVersion` / region protocol advertisement remains disabled.
+- C2B1 changes only Appearance Core runtime. DEV Region, DEV Robust, Asset Core process,
+  Inventory Core process and LIVE are not restarted.
+- C2B2: complete static avatar_lad.xml layer semantics / parity audit.
+- C3: real Firestorm SSA protocol validation; only then enable CentralBakeVersion.
