@@ -195,21 +195,51 @@ Avatar-Distanz, um wahrgenommene Rez-Zeit und Netzlast zu verbessern.
 7. R5 Interest Management
 8. Scripts/Physics/Persistence nur nach Messdaten
 
+## DEV-RUNTIME STATUS
+
+Die isolierte Novalyth-Dev-Runtime ist eingerichtet:
+
+- Runtime: `/nvme/novalyth-opensim-dev`
+- Runtime-Benutzer: `opensimdev`
+- Robust-Datenbank: `novalyth_robust_dev`
+- Region-Datenbank: `novalyth_region_dev`
+- DB-Benutzer: `novalyth_dev`
+- DB-Secret: `/root/.novalyth-opensim-dev-db.env` (`root:root`, `0600`)
+- Robust Public: `8102`
+- Robust Private: `8103`
+- Region-Port: `9100`
+- Testregion: `Novalyth Dev Lab`
+- Grid-Position: `1100,1100`
+- Region-Größe: `256x256`
+- Dev-Konfiguration verwendet `GridHypergrid.ini`.
+- Firewall und nginx wurden nicht verändert.
+- LIVE `/nvme/opensim` wurde nicht verändert.
+- Robust und Region wurden noch nicht gestartet.
+- Auskommentierte OpenSim-Beispiel-ConnectionStrings mit `Database=opensim`
+  sind weiterhin in den offiziellen Example-basierten INIs vorhanden, aber
+  **nicht aktiv**. Die aktiven ConnectionStrings zeigen ausschließlich auf
+  `novalyth_robust_dev` bzw. `novalyth_region_dev`.
+
 ## 8. CURRENT NEXT ACTION
 
-Nach Abschluss dieses V5-Resume-Setups:
+**Ersten isolierten Baseline-Start kontrolliert durchführen.**
 
-**Eine komplett getrennte Novalyth-Dev-Runtime aufbauen.**
-
-Geplant:
-- `/nvme/novalyth-opensim-dev`
-- eigene Robust-Instanz
-- eigene Region
-- eigene MariaDB-Dev-Datenbanken
-- eigene Ports ohne Kollision mit LIVE
-- keine Produktionsdatenbank verwenden
-- Baseline zuerst starten und messen
-- danach PERFORMANCE R1 im Source beginnen
+1. `novalyth-dev-status`
+2. Robust im Vordergrund starten: `novalyth-dev-robust`
+3. In einer zweiten Shell sofort prüfen:
+   `ss -ltnp | grep -E ':(8102|8103)'`
+4. Prüfen, welche Adressen Robust tatsächlich bindet.
+5. Prüfen, ob ausschließlich `novalyth_robust_dev` migriert/verwendet wird.
+6. Falls Netzwerk oder DB nicht sauber sind: Robust beenden und erst korrigieren.
+7. Wenn Robust sauber läuft, Region im Vordergrund starten:
+   `novalyth-dev-region`
+8. Eventuelle Estate-/Owner-Erstinitialisierung bewusst beantworten.
+9. Prüfen:
+   - Region-Port `9100`
+   - Grid-Position `1100,1100`
+   - ausschließlich `novalyth_region_dev`
+10. Baseline-Start/Logs messen und dokumentieren.
+11. Erst danach **PERFORMANCE R1 – Asset Pipeline** beginnen.
 
 ## 9. Pflegepflicht
 
@@ -223,3 +253,8 @@ Bei jedem relevanten Commit prüfen und aktualisieren:
 6. Was ist CURRENT NEXT ACTION?
 
 Diese Datei muss den Zustand wiedergeben, den ein neuer Chat tatsächlich vorfindet.
+
+
+## INFRASTRUKTUR-ÄNDERUNG 2026-08-14 – PHASE 2
+
+- Phase 2 abgeschlossen: isolierte Dev-Runtime, getrennte Robust-/Region-DBs, dedizierte Ports und Testregion vorbereitet; erster kontrollierter Baseline-Start steht aus.
