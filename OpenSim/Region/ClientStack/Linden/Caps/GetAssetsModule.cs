@@ -91,6 +91,19 @@ namespace OpenSim.Region.ClientStack.Linden
         private static int m_assetMaxOutstanding = 0;
         private static int m_assetMaxOutstandingPerAgent = 0;
         private static int m_queueCommandsRegistered = 0;
+        private static int m_assetFairDispatchSlots = 3;
+
+        private static readonly object m_assetFairLock = new();
+        private static readonly Dictionary<UUID, Queue<APollRequest>> m_assetFairQueues = new();
+        private static readonly Queue<UUID> m_assetFairRoundRobin = new();
+        private static int m_assetFairQueued = 0;
+        private static int m_assetFairPeakQueued = 0;
+        private static int m_assetFairInFlight = 0;
+        private static int m_assetFairPeakInFlight = 0;
+        private static int m_assetFairPeakAgents = 0;
+        private static long m_assetFairDispatched = 0;
+        private static long m_assetFairWorkerEnqueueFailures = 0;
+
         protected IUserManagement m_UserManagement = null;
 
         private static void RegisterAssetQueueCommands()
@@ -119,12 +132,14 @@ namespace OpenSim.Region.ClientStack.Linden
         private static void HandleShowAssetQueue(string module, string[] cmd)
         {
             MainConsole.Instance.Output(NovalythAssetQueueGuard.FormatReport());
+            MainConsole.Instance.Output(FormatAssetFairQueueReport());
         }
 
         private static void HandleResetAssetQueue(string module, string[] cmd)
         {
             NovalythAssetQueueGuard.ResetMetrics();
-            MainConsole.Instance.Output("[NOVALYTH] Asset queue guard metrics reset.");
+            ResetAssetFairQueueMetrics();
+            MainConsole.Instance.Output("[NOVALYTH] Asset queue/fair-dispatch metrics reset.");
         }
 
         private static OSHttpResponse BuildAssetBackpressureResponse(
@@ -146,6 +161,128 @@ namespace OpenSim.Region.ClientStack.Linden
                 string.IsNullOrEmpty(reason) ? "capacity" : reason);
 
             return response;
+        }
+
+        private static bool EnqueueFairAssetRequest(APollRequest request)
+        {
+            if (request == null || request.reqID.IsZero() || m_workerpool == null)
+                return false;
+
+            lock (m_assetFairLock)
+            {
+                if (!m_assetFairQueues.TryGetValue(
+                        request.queueAgentID,
+                        out Queue<APollRequest> queue))
+                {
+                    queue = new Queue<APollRequest>();
+                    m_assetFairQueues[request.queueAgentID] = queue;
+                    m_assetFairRoundRobin.Enqueue(request.queueAgentID);
+
+                    if (m_assetFairQueues.Count > m_assetFairPeakAgents)
+                        m_assetFairPeakAgents = m_assetFairQueues.Count;
+                }
+
+                queue.Enqueue(request);
+                ++m_assetFairQueued;
+
+                if (m_assetFairQueued > m_assetFairPeakQueued)
+                    m_assetFairPeakQueued = m_assetFairQueued;
+
+                DispatchFairAssetRequestsLocked();
+                return true;
+            }
+        }
+
+        private static void CompleteFairAssetRequest()
+        {
+            lock (m_assetFairLock)
+            {
+                if (m_assetFairInFlight > 0)
+                    --m_assetFairInFlight;
+
+                DispatchFairAssetRequestsLocked();
+            }
+        }
+
+        private static void DispatchFairAssetRequestsLocked()
+        {
+            while (m_assetFairInFlight < m_assetFairDispatchSlots
+                && m_assetFairRoundRobin.Count > 0)
+            {
+                UUID agentID = m_assetFairRoundRobin.Dequeue();
+
+                if (!m_assetFairQueues.TryGetValue(
+                        agentID,
+                        out Queue<APollRequest> queue)
+                    || queue.Count == 0)
+                {
+                    m_assetFairQueues.Remove(agentID);
+                    continue;
+                }
+
+                APollRequest next = queue.Dequeue();
+                --m_assetFairQueued;
+
+                if (queue.Count > 0)
+                    m_assetFairRoundRobin.Enqueue(agentID);
+                else
+                    m_assetFairQueues.Remove(agentID);
+
+                ++m_assetFairInFlight;
+                ++m_assetFairDispatched;
+
+                if (m_assetFairInFlight > m_assetFairPeakInFlight)
+                    m_assetFairPeakInFlight = m_assetFairInFlight;
+
+                if (!m_workerpool.Enqueue(next))
+                {
+                    --m_assetFairInFlight;
+                    ++m_assetFairWorkerEnqueueFailures;
+
+                    if (next.queueGuardTracked)
+                    {
+                        NovalythAssetQueueGuard.Release(
+                            next.queueAgentID,
+                            enqueueFailure: true);
+                        next.queueGuardTracked = false;
+                    }
+
+                    next.thepoll.FailQueuedRequest(
+                        next,
+                        "worker-unavailable");
+                }
+            }
+        }
+
+        private static string FormatAssetFairQueueReport()
+        {
+            lock (m_assetFairLock)
+            {
+                return string.Format(
+                    "=== NOVALYTH ASSET FAIR DISPATCH ===\n" +
+                    "queue: queued={0} peak_queued={1} inflight={2} peak_inflight={3} active_agents={4} peak_agents={5}\n" +
+                    "traffic: dispatched={6} worker_enqueue_fail={7}",
+                    m_assetFairQueued,
+                    m_assetFairPeakQueued,
+                    m_assetFairInFlight,
+                    m_assetFairPeakInFlight,
+                    m_assetFairQueues.Count,
+                    m_assetFairPeakAgents,
+                    m_assetFairDispatched,
+                    m_assetFairWorkerEnqueueFailures);
+            }
+        }
+
+        private static void ResetAssetFairQueueMetrics()
+        {
+            lock (m_assetFairLock)
+            {
+                m_assetFairPeakQueued = m_assetFairQueued;
+                m_assetFairPeakInFlight = m_assetFairInFlight;
+                m_assetFairPeakAgents = m_assetFairQueues.Count;
+                m_assetFairDispatched = 0;
+                m_assetFairWorkerEnqueueFailures = 0;
+            }
         }
 
         #region Region Module interfaceBase Members
@@ -245,6 +382,7 @@ namespace OpenSim.Region.ClientStack.Linden
 
                 if (m_workerpool == null)
                 {
+                    m_assetFairDispatchSlots = m_capsAssetWorkers;
                     m_workerpool = new ObjectJobEngine(
                         DoAssetRequests, "GetCapsAssetWorker", 1000, m_capsAssetWorkers);
                     NovalythAssetPipelineMetrics.SetCapsConfig(
@@ -259,6 +397,9 @@ namespace OpenSim.Region.ClientStack.Linden
                         "[GETASSETS]: asset queue guard max_outstanding={0}, per_agent={1}",
                         m_assetMaxOutstanding,
                         m_assetMaxOutstandingPerAgent);
+                    m_log.InfoFormat(
+                        "[GETASSETS]: fair asset dispatch=enabled, dispatch_slots={0}",
+                        m_capsAssetWorkers);
                 }
 
                 if (Interlocked.CompareExchange(ref m_commandsRegistered, 1, 0) == 0)
@@ -310,6 +451,8 @@ namespace OpenSim.Region.ClientStack.Linden
                         NovalythAssetQueueGuard.Release(poolreq.queueAgentID);
                         poolreq.queueGuardTracked = false;
                     }
+
+                    CompleteFairAssetRequest();
                 }
             }
         }
@@ -402,7 +545,7 @@ namespace OpenSim.Region.ClientStack.Linden
 
                     NovalythAssetPipelineMetrics.CapsEnqueued();
 
-                    if (!m_workerpool.Enqueue(reqinfo))
+                    if (!EnqueueFairAssetRequest(reqinfo))
                     {
                         if (reqinfo.queueGuardTracked)
                         {
@@ -437,6 +580,39 @@ namespace OpenSim.Region.ClientStack.Linden
                     response["keepalive"] = false;
                     return response;
                 };
+            }
+
+            public void FailQueuedRequest(
+                APollRequest requestinfo, string reason)
+            {
+                UUID requestID = requestinfo.reqID;
+
+                OSHttpResponse response =
+                    BuildAssetBackpressureResponse(
+                        requestinfo.request, reason);
+
+                bool stored = false;
+
+                lock (responses)
+                {
+                    lock (dropedResponses)
+                    {
+                        if (dropedResponses.Contains(requestID))
+                        {
+                            dropedResponses.Remove(requestID);
+                            return;
+                        }
+                    }
+
+                    responses[requestID] = new APollResponse()
+                    {
+                        osresponse = response
+                    };
+                    stored = true;
+                }
+
+                if (stored && UseResponseReadyNotification)
+                    ResponseReady?.Invoke(requestID);
             }
 
             public void Process(APollRequest requestinfo)

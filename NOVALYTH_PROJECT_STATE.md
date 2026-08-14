@@ -527,3 +527,54 @@ CURRENT NEXT ACTION:
 7. Inspect `show asset pipeline` and `show asset queue`.
 8. Only after these measurements decide whether additional fairness scheduling or RegionAsset local-worker tuning is justified.
 9. LIVE `/nvme/opensim` remains untouched.
+
+### R1 Stage 4.1 – Work-Conserving Fair Asset Dispatch
+
+Status: **SOURCE IMPLEMENTATION – DEV TEST PENDING**
+
+Reason for Stage 4.1:
+
+Stage-4 stress validation proved the hard per-agent guard works exactly:
+`peak_per_agent=64`, `reject_agent=935`, `enqueue_fail=0`, final
+`outstanding=0`.
+
+However, official Firestorm texture-fetch code treats ordinary HTTP 503 asset
+responses as a failed texture fetch. Its explicit Retry-After retry policy is
+used for server-bake fetches, not ordinary texture fetches. Therefore a hard
+per-agent 503 limit is useful as an emergency/abuse control but is not the
+desired normal fairness mechanism.
+
+Stage 4.1 keeps the bounded admission guard and adds a work-conserving
+round-robin dispatcher in front of the existing 3 Asset CAPS workers.
+
+Behavior:
+
+- Global outstanding capacity remains a hard emergency bound.
+- `Cap_AssetMaxOutstandingPerAgent` remains available as an optional hard
+  emergency/abuse limit, but DEV validation will set it to `0`.
+- Normal per-agent fairness is scheduling-based, not rejection-based.
+- Each active agent has one round-robin token regardless of queue length.
+- With one active agent, that agent may use all 3 Asset CAPS workers.
+- With multiple active agents, dispatch rotates across active agent queues.
+- At most `Cap_AssetWorkers` requests are dispatched into ObjectJobEngine at
+  once, so its internal unbounded collection no longer accumulates the entire
+  Asset CAPS backlog.
+- Stage-3 event-driven PollService response wake remains unchanged.
+
+DEV target config for Stage 4.1:
+
+- `Cap_AssetWorkers = 3`
+- `Cap_AssetResponseWake = true`
+- `Cap_AssetMaxOutstanding = 256`
+- `Cap_AssetMaxOutstandingPerAgent = 0`
+
+Validation plan:
+
+1. Deploy Stage 4.1 to DEV only.
+2. Run fixed 1000-asset benchmark at concurrency 32.
+3. Run fixed 1000-asset benchmark at concurrency 256.
+4. At c256, expect no per-agent 503 rejections and fair-dispatch
+   `peak_inflight <= 3`; global outstanding must never exceed 256.
+5. Run a separate c512 emergency-cap test only to prove the global hard bound.
+6. Perform a multi-agent fairness test before calling Stage 4 production-ready.
+7. LIVE remains untouched.
