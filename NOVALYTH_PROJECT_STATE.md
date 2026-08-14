@@ -1683,3 +1683,41 @@ C4D3:
 
 Source/build/commit only. No runtime deployment, restart, INI mutation or LIVE
 `/nvme/opensim` change in this step.
+
+## Appearance C4D4 – avatar_lad local-layer compositor semantics
+
+C4D3 protocol validation succeeded for the test avatar:
+- RegionHandshake SSA bit negotiated.
+- AppearanceData emitted with AppearanceVersion=1 and authoritative COF.
+- Legacy AvatarNowWearing was observed and suppressed for the SSA path.
+- Server bake publication completed.
+
+Visual testing still showed large solid blue/gray areas on skin/clothing and
+different-looking self/observer renders.
+
+Root compositor bug:
+- `BuildAvatarLadStaticLayer()` considered any layer with color/alpha params to
+  be an independent static layer.
+- If that avatar_lad layer had only a `local_texture` and no static TGA, the
+  method created a full 2048x2048 solid image in the evaluated wearable color.
+- The real local texture was then drawn later on top of that solid canvas.
+- Official avatar_lad contains this pattern extensively, e.g. upper_clothes,
+  skirt, hair base and iris: local texture plus tint/alpha parameters.
+- This polluted uncovered body/bake pixels with shirt/skirt/hair/eye color,
+  producing the observed bright blue/gray full surfaces.
+
+C4D4:
+- A standalone static layer is now built only for:
+  1. a real static TGA resource, or
+  2. an intentional color/alpha-only layer with no texture definitions at all.
+- A layer containing only local textures no longer generates a full-canvas
+  solid layer.
+- Local texture tint and alpha continue through
+  `AppearanceManager.TextureData` + `PrepareSourceLayer`.
+- Static skin grain/resources, visibility/static masks and intentional
+  color-only layers remain supported.
+- Per-texture Tattoo/Universal RGB override remains because modern wearables can
+  carry independent colors per local texture channel.
+
+No C4D3 protocol rollback. No runtime deploy/restart/INI/LIVE change in this
+source-only step.

@@ -1222,6 +1222,12 @@ namespace Novalyth.Server.Appearance
             return errors.Count == 0;
         }
 
+        // C4D4 NOTE:
+        // DecodeWearableParams supplies the normal wearable tint/masks. Keep
+        // this per-texture RGB override for modern Tattoo/Universal channels,
+        // where one wearable can carry different colors for different local
+        // texture indices. This modifies only the source texture, never the
+        // whole bake canvas.
         private static Color4 ResolveLayerColor(
             AssetWearable wearable,
             int textureIndex,
@@ -1520,10 +1526,32 @@ namespace Novalyth.Server.Appearance
             int width,
             int height)
         {
+            // NOVALYTH APPEARANCE C4D4
+            //
+            // avatar_lad color/alpha parameters on a layer containing a
+            // local_texture describe how that LOCAL texture is rendered.
+            // They are not an additional full-canvas solid-color layer.
+            //
+            // The old implementation treated any color/alpha parameter as a
+            // reason to create a solid width*height image when no static TGA
+            // existed. For layers such as upper_clothes, skirt, hair base and
+            // iris this painted the entire bake with the wearable tint before
+            // drawing the actual local texture. That is the source of the
+            // blue/gray body and dress pollution seen in C4D3 testing.
+            //
+            // Local texture tint + alpha is already carried by
+            // AppearanceManager.TextureData and applied in PrepareSourceLayer.
             bool hasStaticTexture =
                 layer.Textures.Any(
                     x => x.TextureIndex < 0 &&
                          !string.IsNullOrWhiteSpace(x.TgaFile));
+
+            bool hasLocalTexture =
+                layer.Textures.Any(
+                    x => x.TextureIndex >= 0);
+
+            bool hasAnyTexture =
+                layer.Textures.Count > 0;
 
             bool hasColorOrAlpha =
                 layer.FixedColor != null ||
@@ -1532,8 +1560,22 @@ namespace Novalyth.Server.Appearance
                     x => x.Color != null ||
                          x.Alpha != null);
 
-            if (!hasStaticTexture && !hasColorOrAlpha)
+            // Only build an independent static layer when:
+            //   1) avatar_lad names a real static TGA resource, or
+            //   2) the layer contains NO texture at all and is intentionally
+            //      a pure color/alpha layer.
+            //
+            // A local_texture-only layer must return null here; its actual
+            // source pixels are processed later by PrepareSourceLayer.
+            bool isIntentionalColorOnlyLayer =
+                !hasAnyTexture &&
+                hasColorOrAlpha;
+
+            if (!hasStaticTexture &&
+                !isIntentionalColorOnlyLayer)
+            {
                 return null;
+            }
 
             Color4 color =
                 EvaluateAvatarLadLayerColor(
@@ -1607,7 +1649,14 @@ namespace Novalyth.Server.Appearance
             }
 
             if (output == null)
-                output = CreateSolidLayer(width, height, color);
+            {
+                // Reaching this point means an intentional color-only layer:
+                // no static TGA and no local texture exists.
+                output = CreateSolidLayer(
+                    width,
+                    height,
+                    color);
+            }
 
             ApplyAvatarLadParamAlpha(
                 output,
