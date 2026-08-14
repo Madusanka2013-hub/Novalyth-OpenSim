@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) Contributors, http://opensimulator.org/
  * See CONTRIBUTORS.TXT for a full list of copyright holders.
  *
@@ -47,6 +47,12 @@ namespace OpenSim.Framework.Servers.HttpServer
         public DropMethod Drop;
         public UUID Id;
         public int TimeOutms;
+
+        // NOVALYTH R1 Stage 3:
+        // Opt-in wake-up path for handlers that can signal that a response
+        // became ready. Existing poll handlers keep the legacy retry path.
+        public bool UseResponseReadyNotification { get; set; }
+        public Action<UUID> ResponseReady { get; set; }
 
         public string Url { get; set; }
 

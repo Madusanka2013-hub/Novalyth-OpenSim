@@ -362,3 +362,32 @@ Measurement procedure after DEV deployment:
 5. Record results.
 6. Repeat as warm-load test.
 7. Increase concurrency only if queue wait/peak proves it is the bottleneck.
+
+### R1 Stage 3 – Event-driven Asset CAPS Response Wake
+
+Implemented in source, pending DEV deployment/test:
+
+- Added opt-in `PollServiceEventArgs.UseResponseReadyNotification`.
+- Added an event-driven request state machine to prevent duplicate scheduling during response-ready/worker races.
+- Added immediate `ResponseReady` wake-up support in `PollServiceRequestManager`.
+- Existing non-opt-in poll services retain the legacy 100 ms retry cadence unchanged.
+- The 100 ms watcher remains as timeout/disconnect/lost-notification fallback for opt-in requests.
+- `GetAssetsModule` opts asset CAPS into the wake-up path only when `[ClientStack.LindenCaps] Cap_AssetResponseWake = true`.
+- `Cap_AssetResponseWake` defaults to `false` for upstream-compatible behavior until explicitly enabled.
+- CAPS asset worker count remains 3; the 8-worker benchmark was worse and is rejected for now.
+- No LIVE runtime change is part of this source commit.
+
+Measured pre-Stage-3 baseline using 500 distinct textures + 500 distinct meshes, benchmark concurrency 32:
+
+- 3 CAPS workers: 1000 requests in 3.224 s, 310.15 req/s, client p50 100.20 ms, p95 111.13 ms, p99 200.68 ms.
+- 8 CAPS workers: 1000 requests in 5.629 s, 177.66 req/s, client p50 99.90 ms, p95 109.95 ms, p99 2529.30 ms.
+- Backend/region-local latency remained far below client p50, pointing at PollService response polling rather than the asset backend.
+
+CURRENT NEXT ACTION:
+
+1. Deploy the exact Stage-3 commit only to `/nvme/novalyth-opensim-dev`.
+2. Keep `Cap_AssetWorkers = 3`.
+3. Enable DEV-only `Cap_AssetResponseWake = true`.
+4. Run the same fixed 1000-asset benchmark with concurrency 32.
+5. Compare client p50/p95/p99 and `show asset pipeline` against the Stage-2 3-worker baseline.
+6. If client p50 drops materially below the legacy ~100 ms floor without errors/timeouts, retain the event-driven path and proceed to controlled backpressure/fairness work.

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) Contributors, http://opensimulator.org/
  * See CONTRIBUTORS.TXT for a full list of copyright holders.
  *
@@ -31,6 +31,7 @@ using System.Collections.Generic;
 using System.Net;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using OSHttpServer;
 using log4net;
 using OpenMetaverse;
@@ -46,12 +47,31 @@ namespace OpenSim.Framework.Servers.HttpServer
         public readonly int RequestTime;
         public readonly UUID RequestID;
 
+        // NOVALYTH R1 Stage 3 event-driven scheduling state:
+        // 0 = waiting, 1 = queued/processing, 2 = completed.
+        private int m_eventDrivenState;
+
         public PollServiceHttpRequest(PollServiceEventArgs pPollServiceArgs, IHttpRequest pRequest)
         {
             PollServiceArgs = pPollServiceArgs;
             Request = pRequest;
             RequestTime = System.Environment.TickCount;
             RequestID = UUID.Random();
+        }
+
+        internal bool TryScheduleEventDriven()
+        {
+            return Interlocked.CompareExchange(ref m_eventDrivenState, 1, 0) == 0;
+        }
+
+        internal void MarkEventDrivenWaiting()
+        {
+            Interlocked.CompareExchange(ref m_eventDrivenState, 0, 1);
+        }
+
+        internal void MarkEventDrivenCompleted()
+        {
+            Volatile.Write(ref m_eventDrivenState, 2);
         }
 
         internal void DoHTTPGruntWork(Hashtable responsedata)

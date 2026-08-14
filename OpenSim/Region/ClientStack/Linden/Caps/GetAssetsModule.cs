@@ -85,6 +85,7 @@ namespace OpenSim.Region.ClientStack.Linden
         private static int m_NumberScenes = 0;
         private static object m_loadLock = new object();
         private static int m_commandsRegistered = 0;
+        private static bool m_assetResponseWake = false;
         protected IUserManagement m_UserManagement = null;
 
         #region Region Module interfaceBase Members
@@ -103,6 +104,7 @@ namespace OpenSim.Region.ClientStack.Linden
             m_capsAssetWorkers = Math.Clamp(config.GetInt("Cap_AssetWorkers", 3), 1, 64);
             m_assetFetchTimeoutMs = Math.Clamp(
                 config.GetInt("Cap_AssetFetchTimeoutMs", 15000), 1000, 120000);
+            m_assetResponseWake = config.GetBoolean("Cap_AssetResponseWake", false);
 
             m_GetTextureURL = config.GetString("Cap_GetTexture", string.Empty);
             if (m_GetTextureURL != string.Empty)
@@ -175,6 +177,9 @@ namespace OpenSim.Region.ClientStack.Linden
                     m_log.InfoFormat(
                         "[GETASSETS]: CAPS asset workers={0}, fetch timeout={1} ms",
                         m_capsAssetWorkers, m_assetFetchTimeoutMs);
+                    m_log.InfoFormat(
+                        "[GETASSETS]: asset response wake={0}",
+                        m_assetResponseWake ? "enabled" : "disabled");
                 }
 
                 if (Interlocked.CompareExchange(ref m_commandsRegistered, 1, 0) == 0)
@@ -244,6 +249,7 @@ namespace OpenSim.Region.ClientStack.Linden
             {
                 m_scene = scene;
                 m_hgassets = HGAssetSVC;
+                UseResponseReadyNotification = GetAssetsModule.m_assetResponseWake;
 
                 HasEvents = delegate(UUID requestID, UUID _)
                 {
@@ -369,6 +375,9 @@ namespace OpenSim.Region.ClientStack.Linden
                     };
                     responses[requestID] = preq;
                 }
+
+                if (UseResponseReadyNotification)
+                    ResponseReady?.Invoke(requestID);
             }
         }
 

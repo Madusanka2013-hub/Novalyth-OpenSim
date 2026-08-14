@@ -30,6 +30,7 @@ using System.Collections;
 using System.Threading;
 using System.Reflection;
 using log4net;
+using OpenMetaverse;
 using OpenSim.Framework.Monitoring;
 using Amib.Threading;
 using System.Collections.Generic;
@@ -42,6 +43,7 @@ namespace OpenSim.Framework.Servers.HttpServer
         private static readonly ILog m_log = LogManager.GetLogger(MethodBase.GetCurrentMethod().DeclaringType);
 
         private readonly ConcurrentQueue<PollServiceHttpRequest> m_retryRequests = new();
+        private readonly ConcurrentDictionary<UUID, PollServiceHttpRequest> m_eventDrivenRequests = new();
         private readonly int m_WorkerThreadCount = 0;
         private ObjectJobEngine m_workerPool;
         private Thread m_retrysThread;
@@ -77,20 +79,101 @@ namespace OpenSim.Framework.Servers.HttpServer
                 m_retryRequests.Enqueue(req);
         }
 
+        private void NotifyResponseReady(UUID requestID)
+        {
+            if (!m_running)
+                return;
+
+            if (m_eventDrivenRequests.TryGetValue(requestID, out PollServiceHttpRequest req)
+                && req.TryScheduleEventDriven())
+            {
+                m_workerPool.Enqueue(req);
+            }
+        }
+
+        private void CompleteEventDriven(PollServiceHttpRequest req)
+        {
+            if (!req.PollServiceArgs.UseResponseReadyNotification)
+                return;
+
+            req.MarkEventDrivenCompleted();
+            m_eventDrivenRequests.TryRemove(req.RequestID, out _);
+        }
+
+        private void ParkEventDriven(PollServiceHttpRequest req, bool recheckReady)
+        {
+            req.MarkEventDrivenWaiting();
+
+            if (!recheckReady || !m_running)
+                return;
+
+            bool ready;
+            try
+            {
+                ready = req.PollServiceArgs.HasEvents(req.RequestID, req.PollServiceArgs.Id);
+            }
+            catch
+            {
+                ready = true;
+            }
+
+            if (ready && req.TryScheduleEventDriven())
+                m_workerPool.Enqueue(req);
+        }
+
         public void Enqueue(PollServiceHttpRequest req)
         {
-            if(m_running)
-                m_workerPool.Enqueue(req);
+            if (!m_running)
+                return;
+
+            if (req.PollServiceArgs.UseResponseReadyNotification)
+            {
+                req.PollServiceArgs.ResponseReady = NotifyResponseReady;
+                m_eventDrivenRequests.TryAdd(req.RequestID, req);
+
+                if (req.TryScheduleEventDriven())
+                    m_workerPool.Enqueue(req);
+
+                return;
+            }
+
+            m_workerPool.Enqueue(req);
         }
 
         private void CheckRetries()
         {
             while (m_running)
             {
+                // Legacy cadence stays unchanged for all existing poll users.
+                // Event-driven handlers normally never wait for this loop.
                 Thread.Sleep(100);
                 Watchdog.UpdateThread();
+
                 while (m_running && m_retryRequests.TryDequeue(out PollServiceHttpRequest preq))
                     m_workerPool.Enqueue(preq);
+
+                foreach (KeyValuePair<UUID, PollServiceHttpRequest> kvp in m_eventDrivenRequests)
+                {
+                    PollServiceHttpRequest req = kvp.Value;
+                    bool shouldSchedule = false;
+
+                    try
+                    {
+                        if (!req.Request.Context.CanSend())
+                            shouldSchedule = true;
+                        else if ((Environment.TickCount - req.RequestTime) > req.PollServiceArgs.TimeOutms)
+                            shouldSchedule = true;
+                        else if (req.PollServiceArgs.HasEvents(req.RequestID, req.PollServiceArgs.Id))
+                            shouldSchedule = true;
+                    }
+                    catch
+                    {
+                        shouldSchedule = true;
+                    }
+
+                    if (shouldSchedule && req.TryScheduleEventDriven())
+                        m_workerPool.Enqueue(req);
+                }
             }
         }
 
@@ -107,6 +190,16 @@ namespace OpenSim.Framework.Servers.HttpServer
             {
                 while (m_retryRequests.TryDequeue(out PollServiceHttpRequest req))
                     req.DoHTTPstop();
+
+                foreach (KeyValuePair<UUID, PollServiceHttpRequest> kvp in m_eventDrivenRequests)
+                {
+                    PollServiceHttpRequest req = kvp.Value;
+                    if (req.TryScheduleEventDriven())
+                    {
+                        req.DoHTTPstop();
+                        CompleteEventDriven(req);
+                    }
+                }
             }
             catch
             {
@@ -118,6 +211,7 @@ namespace OpenSim.Framework.Servers.HttpServer
 
             m_workerPool.Dispose();
             m_workerPool = null;
+            m_eventDrivenRequests.Clear();
         }
 
         // work threads
@@ -126,23 +220,33 @@ namespace OpenSim.Framework.Servers.HttpServer
         {
             if (o is not PollServiceHttpRequest req)
                 return;
+
+            bool eventDriven = req.PollServiceArgs.UseResponseReadyNotification;
+
             try
             {
                 if (!req.Request.Context.CanSend())
                 {
                     req.PollServiceArgs.Drop(req.RequestID, req.PollServiceArgs.Id);
+                    if (eventDriven)
+                        CompleteEventDriven(req);
                     return;
                 }
 
                 if(!m_running)
                 {
                     req.DoHTTPstop();
+                    if (eventDriven)
+                        CompleteEventDriven(req);
                     return;
                 }
 
                 if (req.Request.Context.IsSending())
                 {
-                    ReQueueEvent(req);
+                    if (eventDriven)
+                        ParkEventDriven(req, false);
+                    else
+                        ReQueueEvent(req);
                     return;
                 }
 
@@ -154,6 +258,11 @@ namespace OpenSim.Framework.Servers.HttpServer
                         req.DoHTTPGruntWork(responsedata);
                     }
                     catch { }
+                    finally
+                    {
+                        if (eventDriven)
+                            CompleteEventDriven(req);
+                    }
                 }
                 else
                 {
@@ -164,6 +273,17 @@ namespace OpenSim.Framework.Servers.HttpServer
                             req.DoHTTPGruntWork(req.PollServiceArgs.NoEvents(req.RequestID, req.PollServiceArgs.Id));
                         }
                         catch { }
+                        finally
+                        {
+                            if (eventDriven)
+                                CompleteEventDriven(req);
+                        }
+                    }
+                    else if (eventDriven)
+                    {
+                        // Close the race where ResponseReady arrives while
+                        // this worker still owns state=processing.
+                        ParkEventDriven(req, true);
                     }
                     else
                     {
@@ -174,6 +294,19 @@ namespace OpenSim.Framework.Servers.HttpServer
             catch (Exception e)
             {
                 m_log.Error($"Exception in poll service thread: {e}");
+
+                if (eventDriven)
+                {
+                    try
+                    {
+                        req.DoHTTPstop();
+                    }
+                    catch
+                    {
+                    }
+
+                    CompleteEventDriven(req);
+                }
             }
         }
     }
