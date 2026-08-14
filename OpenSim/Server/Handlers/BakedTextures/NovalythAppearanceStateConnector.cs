@@ -15,6 +15,7 @@ using System.Linq;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Xml.Linq;
 using System.Threading;
 using log4net;
 using Nini.Config;
@@ -204,6 +205,62 @@ namespace Novalyth.Server.Appearance
         // not turn 2K compositing into an unbounded memory spike.
         private static readonly SemaphoreSlim s_bakeConcurrency = new(2, 2);
 
+        private const string AvatarLadSourceCommit =
+            "dcff8c97ea5448f0acaff76fa0a74a89889be678";
+
+        private static readonly string s_avatarLadPath =
+            System.IO.Path.Combine(
+                AppContext.BaseDirectory,
+                "openmetaverse_data",
+                "novalyth_avatar_lad.xml");
+
+        private static readonly System.Lazy<AvatarLadProfile> s_avatarLadProfile =
+            new(LoadAvatarLadProfile, true);
+
+        private static readonly IReadOnlyDictionary<string, int>
+            s_avatarLadLocalTextureIndices =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["head_bodypaint"] = 0,
+                ["upper_shirt"] = 1,
+                ["lower_pants"] = 2,
+                ["eyes_iris"] = 3,
+                ["hair"] = 4,
+                ["hair_grain"] = 4,
+                ["upper_bodypaint"] = 5,
+                ["lower_bodypaint"] = 6,
+                ["lower_shoes"] = 7,
+                ["lower_socks"] = 12,
+                ["upper_jacket"] = 13,
+                ["lower_jacket"] = 14,
+                ["upper_gloves"] = 15,
+                ["upper_undershirt"] = 16,
+                ["lower_underpants"] = 17,
+                ["skirt"] = 18,
+                ["lower_alpha"] = 21,
+                ["upper_alpha"] = 22,
+                ["head_alpha"] = 23,
+                ["eyes_alpha"] = 24,
+                ["hair_alpha"] = 25,
+                ["head_tattoo"] = 26,
+                ["upper_tattoo"] = 27,
+                ["lower_tattoo"] = 28,
+                ["head_universal_tattoo"] = 29,
+                ["upper_universal_tattoo"] = 30,
+                ["lower_universal_tattoo"] = 31,
+                ["skirt_tattoo"] = 32,
+                ["hair_tattoo"] = 33,
+                ["eyes_tattoo"] = 34,
+                ["left_arm_tattoo"] = 35,
+                ["leftarm_tattoo"] = 35,
+                ["left_leg_tattoo"] = 36,
+                ["leftleg_tattoo"] = 36,
+                ["aux1_tattoo"] = 37,
+                ["aux2_tattoo"] = 38,
+                ["aux3_tattoo"] = 39
+            };
+
+
         // Direct RGB visual-param triplets for local textures whose tint is
         // channel-specific. This is especially important for Universal
         // wearables: one Universal asset can carry different colors for head,
@@ -265,8 +322,12 @@ namespace Novalyth.Server.Appearance
             m_inventory = inventory;
             m_assets = assets;
 
+            AvatarLadProfile avatarLad = s_avatarLadProfile.Value;
+            if (avatarLad.Sets.Count != 11)
+                throw new Exception("Novalyth C2B2 avatar_lad profile does not contain 11 bake layer sets");
+
             m_log.InfoFormat(
-                "[NOVALYTH APPEARANCE C2B1]: 11-slot compositor foundation + J2K Asset Core store online; contract={0}; bake-ready={1}",
+                "[NOVALYTH APPEARANCE C2B2]: 11-slot compositor foundation + J2K Asset Core store online; contract={0}; bake-ready={1}",
                 m_bakeContractVersion,
                 m_bakeReady);
         }
@@ -291,7 +352,7 @@ namespace Novalyth.Server.Appearance
                 OSDMap health = new();
                 health["status"] = "ok";
                 health["service"] = "Novalyth Appearance Core";
-                health["phase"] = "C2B1";
+                health["phase"] = "C2B2";
                 health["sl_ssa_protocol_surface"] = true;
                 health["authoritative_cof"] = "Inventory Core";
                 health["bake_contract_version"] = m_bakeContractVersion;
@@ -300,7 +361,11 @@ namespace Novalyth.Server.Appearance
                 health["source_texture_graph"] = true;
                 health["source_j2k_decode_audit"] = true;
                 health["pixel_compositor"] = true;
-                health["compositor_profile"] = "novalyth-c2b1-modern-foundation-v1";
+                health["compositor_profile"] = "novalyth-c2b2-avatar-lad-v1";
+                health["avatar_lad_profile"] = true;
+                health["avatar_lad_source_commit"] = AvatarLadSourceCommit;
+                health["avatar_lad_layer_sets"] = s_avatarLadProfile.Value.Sets.Count;
+                health["avatar_lad_static_layer_parity"] = true;
                 health["bake_asset_store"] = true;
                 health["bake_asset_authority"] = "Asset Core";
                 health["central_bake_advertised"] = false;
@@ -439,7 +504,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C2B1]: state read failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B2]: state read failed for {0}: {1}",
                     agentID,
                     e.Message);
             }
@@ -484,7 +549,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C2B1]: manifest read failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B2]: manifest read failed for {0}: {1}",
                     agentID,
                     e.Message);
                 return null;
@@ -500,7 +565,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C2B1]: Inventory Core COF lookup failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B2]: Inventory Core COF lookup failed for {0}: {1}",
                     agentID,
                     e.Message);
                 return null;
@@ -669,7 +734,7 @@ namespace Novalyth.Server.Appearance
                             manifest,
                             out string bakeError))
                     {
-                        manifest["status"] = "c2b1_bake_failed";
+                        manifest["status"] = "c2b2_bake_failed";
                         manifest["pixel_compositor_status"] = "failed";
                         manifest["bake_error"] = bakeError ?? string.Empty;
                         SaveManifest(agentID, manifest);
@@ -677,7 +742,7 @@ namespace Novalyth.Server.Appearance
 
                         OSDMap fail = new();
                         fail["success"] = false;
-                        fail["error"] = bakeError ?? "c2b1_bake_failed";
+                        fail["error"] = bakeError ?? "c2b2_bake_failed";
                         fail["recipe_hash"] = manifest["recipe_hash"].AsString();
                         WriteMap(response, HttpStatusCode.OK, fail);
                         return;
@@ -719,6 +784,12 @@ namespace Novalyth.Server.Appearance
                 return false;
             }
 
+            if (!previous.TryGetValue("compositor_profile", out OSD previousProfile) ||
+                previousProfile.AsString() != "novalyth-c2b2-avatar-lad-v1")
+            {
+                return false;
+            }
+
             if (!previous.TryGetValue("bakes", out OSD previousBakesOSD) ||
                 previousBakesOSD is not OSDArray previousBakes ||
                 previousBakes.Count != s_bakeDefinitions.Length)
@@ -756,7 +827,7 @@ namespace Novalyth.Server.Appearance
             current["bake_asset_authority"] = "Asset Core";
             current["bake_generated_utc"] =
                 previous["bake_generated_utc"].AsString();
-            current["status"] = "c2b1_bakes_ready_not_advertised";
+            current["status"] = "c2b2_bakes_ready_not_advertised";
             return true;
         }
 
@@ -770,6 +841,7 @@ namespace Novalyth.Server.Appearance
             if (!TryBuildBakeLayerInputs(
                     manifest,
                     out Dictionary<string, List<BakeLayerInput>> layersByBake,
+                    out Dictionary<int, float> visualParams,
                     out List<string> inputErrors))
             {
                 error = inputErrors.Count > 0
@@ -802,6 +874,7 @@ namespace Novalyth.Server.Appearance
                 if (!TryCompositeBake(
                         bake,
                         layers,
+                        visualParams,
                         out byte[] encoded,
                         out int width,
                         out int height,
@@ -839,7 +912,7 @@ namespace Novalyth.Server.Appearance
                         agentID.ToString())
                     {
                         Data = encoded,
-                        Description = "Novalyth C2B1 " + bake.Name,
+                        Description = "Novalyth C2B2 " + bake.Name,
                         Local = false,
                         Temporary = false,
                         Flags = AssetFlags.Normal
@@ -853,7 +926,7 @@ namespace Novalyth.Server.Appearance
                     catch (Exception e)
                     {
                         m_log.ErrorFormat(
-                            "[NOVALYTH APPEARANCE C2B1]: bake asset store failed {0}/{1}: {2}",
+                            "[NOVALYTH APPEARANCE C2B2]: bake asset store failed {0}/{1}: {2}",
                             agentID,
                             bake.Name,
                             e.Message);
@@ -875,20 +948,20 @@ namespace Novalyth.Server.Appearance
                 bakeMap["j2k_bytes"] = encoded.Length;
                 bakeMap["j2k_sha256"] = j2kHash;
                 bakeMap["compositor_profile"] =
-                    "novalyth-c2b1-modern-foundation-v1";
+                    "novalyth-c2b2-avatar-lad-v1";
                 bakeMap["error"] = string.Empty;
             }
 
-            manifest["pixel_compositor_status"] = "c2b1_ready";
+            manifest["pixel_compositor_status"] = "c2b2_ready";
             manifest["compositor_profile"] =
-                "novalyth-c2b1-modern-foundation-v1";
+                "novalyth-c2b2-avatar-lad-v1";
             manifest["compositor_semantics"] =
-                "modern_11_slot_source_layers_tint_param_masks_partial_static_layers";
+                "official_avatar_lad_order_static_tga_global_param_colors_alpha_bump_modern_11_slot_sources";
             manifest["bake_asset_store_status"] = "asset_core_ready";
             manifest["bake_asset_authority"] = "Asset Core";
             manifest["bake_generated_utc"] = DateTime.UtcNow.ToString("O");
             manifest["central_bake_advertised"] = false;
-            manifest["status"] = "c2b1_bakes_ready_not_advertised";
+            manifest["status"] = "c2b2_bakes_ready_not_advertised";
 
             return true;
         }
@@ -896,6 +969,7 @@ namespace Novalyth.Server.Appearance
         private bool TryBuildBakeLayerInputs(
             OSDMap manifest,
             out Dictionary<string, List<BakeLayerInput>> layersByBake,
+            out Dictionary<int, float> visualParams,
             out List<string> errors)
         {
             layersByBake = new Dictionary<string, List<BakeLayerInput>>(
@@ -905,6 +979,7 @@ namespace Novalyth.Server.Appearance
                 layersByBake[bake.Name] = new List<BakeLayerInput>();
 
             errors = new List<string>();
+            visualParams = new Dictionary<int, float>();
 
             if (!manifest.TryGetValue("wearables", out OSD wearablesOSD) ||
                 wearablesOSD is not OSDArray wearables)
@@ -977,6 +1052,9 @@ namespace Novalyth.Server.Appearance
                     errors.Add(wearableAssetID + ":wearable_decode_failed");
                     continue;
                 }
+
+                foreach (KeyValuePair<int, float> parameter in wearableAsset.Params)
+                    visualParams[parameter.Key] = parameter.Value;
 
                 AppearanceManager.TextureData[] temp =
                     new AppearanceManager.TextureData[
@@ -1115,6 +1193,7 @@ namespace Novalyth.Server.Appearance
         private bool TryCompositeBake(
             BakeDefinition bake,
             List<BakeLayerInput> layers,
+            Dictionary<int, float> visualParams,
             out byte[] encoded,
             out int width,
             out int height,
@@ -1123,8 +1202,23 @@ namespace Novalyth.Server.Appearance
             encoded = Array.Empty<byte>();
             error = string.Empty;
 
-            width = bake.Name == "eyes" ? 512 : 2048;
-            height = width;
+            AvatarLadProfile profile = s_avatarLadProfile.Value;
+            if (!profile.Sets.TryGetValue(bake.Name, out AvatarLadSet set))
+            {
+                width = 0;
+                height = 0;
+                error = "avatar_lad_layer_set_missing:" + bake.Name;
+                return false;
+            }
+
+            width = set.Width;
+            height = set.Height;
+
+            if (width <= 0 || height <= 0)
+            {
+                error = "avatar_lad_invalid_size:" + bake.Name;
+                return false;
+            }
 
             ManagedImage baked = new(
                 width,
@@ -1133,77 +1227,168 @@ namespace Novalyth.Server.Appearance
                 ManagedImage.ImageChannels.Alpha |
                 ManagedImage.ImageChannels.Bump);
 
-            InitializeBakeBase(bake.Name, baked, layers);
+            FillDithered(baked, Color4.White);
 
-            bool firstAlphaCarryingColorLayer = true;
-            List<BakeLayerInput> visibilityMasks = new();
+            Dictionary<int, List<BakeLayerInput>> byIndex = new();
+            foreach (BakeLayerInput input in layers)
+            {
+                if (!byIndex.TryGetValue(
+                        input.TextureIndex,
+                        out List<BakeLayerInput> list))
+                {
+                    list = new List<BakeLayerInput>();
+                    byIndex[input.TextureIndex] = list;
+                }
+                list.Add(input);
+            }
+
+            HashSet<BakeLayerInput> consumed = new();
+            List<ManagedImage> visibilityMasks = new();
+
+            foreach (AvatarLadLayer layer in set.Layers)
+            {
+                if (string.Equals(
+                        layer.RenderPass,
+                        "bump",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    ApplyAvatarLadBumpLayer(
+                        baked,
+                        layer,
+                        visualParams,
+                        width,
+                        height);
+                    continue;
+                }
+
+                ManagedImage staticLayer =
+                    BuildAvatarLadStaticLayer(
+                        layer,
+                        visualParams,
+                        width,
+                        height);
+
+                if (staticLayer != null)
+                {
+                    if (layer.VisibilityMask)
+                        visibilityMasks.Add(staticLayer);
+                    else
+                        DrawLayer(baked, staticLayer, false);
+                }
+
+                foreach (AvatarLadTexture textureDef in layer.Textures)
+                {
+                    if (textureDef.TextureIndex < 0)
+                        continue;
+
+                    if (!byIndex.TryGetValue(
+                            textureDef.TextureIndex,
+                            out List<BakeLayerInput> sourceLayers))
+                    {
+                        continue;
+                    }
+
+                    foreach (BakeLayerInput sourceLayer in sourceLayers)
+                    {
+                        ManagedImage source =
+                            PrepareSourceLayer(
+                                sourceLayer,
+                                bake.Name,
+                                width,
+                                height,
+                                out string sourceError);
+
+                        if (source == null)
+                        {
+                            if (!string.IsNullOrEmpty(sourceError))
+                            {
+                                error = sourceError;
+                                return false;
+                            }
+                            continue;
+                        }
+
+                        consumed.Add(sourceLayer);
+
+                        if (layer.VisibilityMask ||
+                            IsVisibilityTextureIndex(sourceLayer.TextureIndex))
+                        {
+                            visibilityMasks.Add(source);
+                            continue;
+                        }
+
+                        bool preserveAlpha =
+                            !set.ClearAlpha &&
+                            (bake.Name == "hair" ||
+                             bake.Name == "skirt");
+
+                        DrawLayer(baked, source, preserveAlpha);
+                    }
+                }
+            }
+
+            // Keep valid future/local entries even if the pinned profile does not
+            // name them yet. Current universal entries are all profile-mapped.
+            foreach (BakeLayerInput layer in layers)
+            {
+                if (consumed.Contains(layer) ||
+                    IsVisibilityTextureIndex(layer.TextureIndex))
+                {
+                    continue;
+                }
+
+                ManagedImage source =
+                    PrepareSourceLayer(
+                        layer,
+                        bake.Name,
+                        width,
+                        height,
+                        out string sourceError);
+
+                if (source == null)
+                {
+                    if (!string.IsNullOrEmpty(sourceError))
+                    {
+                        error = sourceError;
+                        return false;
+                    }
+                    continue;
+                }
+
+                DrawLayer(baked, source, false);
+            }
 
             foreach (BakeLayerInput layer in layers)
             {
-                if (IsVisibilityTextureIndex(layer.TextureIndex))
+                if (!IsVisibilityTextureIndex(layer.TextureIndex) ||
+                    consumed.Contains(layer))
                 {
-                    visibilityMasks.Add(layer);
                     continue;
                 }
 
-                if (layer.TextureData.Texture?.Image == null)
-                    continue;
+                ManagedImage source =
+                    PrepareSourceLayer(
+                        layer,
+                        bake.Name,
+                        width,
+                        height,
+                        out string sourceError);
 
-                ManagedImage texture = layer.TextureData.Texture.Image.Clone();
-
-                if (texture.Width != width || texture.Height != height)
-                {
-                    try
-                    {
-                        texture.ResizeNearestNeighbor(width, height);
-                    }
-                    catch (Exception e)
-                    {
-                        error =
-                            "resize_failed:" + layer.TextureID + ":" +
-                            e.GetType().Name;
-                        return false;
-                    }
-                }
-
-                if (!IsBodypaintTextureIndex(layer.TextureIndex))
-                    ApplyTint(texture, layer.TextureData.Color);
-
-                ApplyParamMasks(
-                    texture,
-                    layer.TextureData.AlphaMasks,
-                    bake.Name);
-
-                bool keepSourceAlpha =
-                    firstAlphaCarryingColorLayer &&
-                    (bake.Name == "hair" || bake.Name == "skirt");
-
-                DrawLayer(baked, texture, keepSourceAlpha);
-                firstAlphaCarryingColorLayer = false;
-            }
-
-            foreach (BakeLayerInput mask in visibilityMasks)
-            {
-                ManagedImage source = mask.TextureData.Texture?.Image;
                 if (source == null)
-                    continue;
-
-                ManagedImage copy = source.Clone();
-                if (copy.Width != width || copy.Height != height)
                 {
-                    try
+                    if (!string.IsNullOrEmpty(sourceError))
                     {
-                        copy.ResizeNearestNeighbor(width, height);
-                    }
-                    catch
-                    {
-                        error = "visibility_mask_resize_failed:" + mask.TextureID;
+                        error = sourceError;
                         return false;
                     }
+                    continue;
                 }
 
-                AddAlpha(baked, copy);
+                visibilityMasks.Add(source);
             }
+
+            foreach (ManagedImage mask in visibilityMasks)
+                AddAlpha(baked, mask);
 
             try
             {
@@ -1224,67 +1409,932 @@ namespace Novalyth.Server.Appearance
             return true;
         }
 
-        private void InitializeBakeBase(
+        private static ManagedImage PrepareSourceLayer(
+            BakeLayerInput layer,
             string bakeSlot,
-            ManagedImage baked,
-            List<BakeLayerInput> layers)
+            int width,
+            int height,
+            out string error)
         {
-            Color4 initial = Color4.White;
+            error = string.Empty;
 
-            if ((bakeSlot == "hair" || bakeSlot == "skirt") &&
-                layers.Count > 0)
+            if (layer.TextureData.Texture?.Image == null)
+                return null;
+
+            ManagedImage texture = layer.TextureData.Texture.Image.Clone();
+
+            if (texture.Width != width || texture.Height != height)
             {
-                initial = layers[0].TextureData.Color;
-            }
-            else if (bakeSlot == "leftarm" ||
-                     bakeSlot == "leftleg" ||
-                     bakeSlot == "aux1" ||
-                     bakeSlot == "aux2" ||
-                     bakeSlot == "aux3")
-            {
-                initial = new Color4(
-                    128f / 255f,
-                    128f / 255f,
-                    128f / 255f,
-                    1f);
+                try
+                {
+                    texture.ResizeNearestNeighbor(width, height);
+                }
+                catch (Exception e)
+                {
+                    error =
+                        "resize_failed:" + layer.TextureID + ":" +
+                        e.GetType().Name;
+                    return null;
+                }
             }
 
-            FillDithered(baked, initial);
+            if (!IsBodypaintTextureIndex(layer.TextureIndex) &&
+                !IsVisibilityTextureIndex(layer.TextureIndex))
+            {
+                ApplyTint(texture, layer.TextureData.Color);
+            }
 
-            if (bakeSlot == "head")
+            if (!IsVisibilityTextureIndex(layer.TextureIndex))
             {
-                ManagedImage headColor = LoadBakeResource("head_color.tga");
-                if (headColor != null)
-                    DrawLayer(baked, headColor, false);
+                ApplyParamMasks(
+                    texture,
+                    layer.TextureData.AlphaMasks,
+                    bakeSlot);
+            }
 
-                ManagedImage headAlpha = LoadBakeResource("head_alpha.tga");
-                if (headAlpha != null)
-                    AddAlpha(baked, headAlpha);
+            return texture;
+        }
 
-                ManagedImage skinGrain = LoadBakeResource("head_skingrain.tga");
-                if (skinGrain != null)
-                    MultiplyLayerFromAlpha(baked, skinGrain);
-            }
-            else if (bakeSlot == "upper" &&
-                     !layers.Any(x => x.TextureIndex == 5))
+        private static ManagedImage BuildAvatarLadStaticLayer(
+            AvatarLadLayer layer,
+            Dictionary<int, float> visualParams,
+            int width,
+            int height)
+        {
+            bool hasStaticTexture =
+                layer.Textures.Any(
+                    x => x.TextureIndex < 0 &&
+                         !string.IsNullOrWhiteSpace(x.TgaFile));
+
+            bool hasColorOrAlpha =
+                layer.FixedColor != null ||
+                !string.IsNullOrWhiteSpace(layer.GlobalColor) ||
+                layer.Params.Any(
+                    x => x.Color != null ||
+                         x.Alpha != null);
+
+            if (!hasStaticTexture && !hasColorOrAlpha)
+                return null;
+
+            Color4 color =
+                EvaluateAvatarLadLayerColor(
+                    layer,
+                    visualParams);
+
+            ManagedImage output = null;
+
+            foreach (AvatarLadTexture textureDef in layer.Textures)
             {
-                ManagedImage upper = LoadBakeResource("upperbody_color.tga");
-                if (upper != null)
-                    DrawLayer(baked, upper, false);
+                if (textureDef.TextureIndex >= 0 ||
+                    string.IsNullOrWhiteSpace(textureDef.TgaFile))
+                {
+                    continue;
+                }
+
+                ManagedImage resource =
+                    string.Equals(
+                        textureDef.TgaFile,
+                        "aux_base.tga",
+                        StringComparison.OrdinalIgnoreCase)
+                        ? CreateSolidLayer(
+                            width,
+                            height,
+                            new Color4(
+                                128f / 255f,
+                                128f / 255f,
+                                128f / 255f,
+                                1f))
+                        : LoadBakeResource(textureDef.TgaFile);
+
+                if (resource == null)
+                    continue;
+
+                if (resource.Width != width ||
+                    resource.Height != height)
+                {
+                    try
+                    {
+                        resource.ResizeNearestNeighbor(
+                            width,
+                            height);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                }
+
+                if (textureDef.FileIsMask)
+                {
+                    ManagedImage colored =
+                        CreateSolidLayer(
+                            width,
+                            height,
+                            color);
+                    ApplyMaskFromImage(
+                        colored,
+                        resource);
+                    resource = colored;
+                }
+                else
+                {
+                    ApplyTint(resource, color);
+                }
+
+                if (output == null)
+                    output = resource;
+                else
+                    DrawLayer(output, resource, false);
             }
-            else if (bakeSlot == "lower" &&
-                     !layers.Any(x => x.TextureIndex == 6))
+
+            if (output == null)
+                output = CreateSolidLayer(width, height, color);
+
+            ApplyAvatarLadParamAlpha(
+                output,
+                layer.Params,
+                visualParams);
+
+            return output;
+        }
+
+        private static void ApplyAvatarLadBumpLayer(
+            ManagedImage baked,
+            AvatarLadLayer layer,
+            Dictionary<int, float> visualParams,
+            int width,
+            int height)
+        {
+            ManagedImage bump =
+                BuildAvatarLadStaticLayer(
+                    layer,
+                    visualParams,
+                    width,
+                    height);
+
+            if (bump == null || baked?.Bump == null)
+                return;
+
+            byte[] source =
+                bump.Alpha ??
+                bump.Red;
+
+            if (source == null ||
+                source.Length != baked.Bump.Length)
             {
-                ManagedImage lower = LoadBakeResource("lowerbody_color.tga");
-                if (lower != null)
-                    DrawLayer(baked, lower, false);
+                return;
             }
-            else if (bakeSlot == "eyes")
+
+            Buffer.BlockCopy(
+                source,
+                0,
+                baked.Bump,
+                0,
+                source.Length);
+        }
+
+        private static ManagedImage CreateSolidLayer(
+            int width,
+            int height,
+            Color4 color)
+        {
+            ManagedImage image = new(
+                width,
+                height,
+                ManagedImage.ImageChannels.Color |
+                ManagedImage.ImageChannels.Alpha);
+
+            byte r = Utils.FloatZeroOneToByte(color.R);
+            byte g = Utils.FloatZeroOneToByte(color.G);
+            byte b = Utils.FloatZeroOneToByte(color.B);
+            byte a = Utils.FloatZeroOneToByte(color.A);
+
+            Array.Fill(image.Red, r);
+            Array.Fill(image.Green, g);
+            Array.Fill(image.Blue, b);
+            Array.Fill(image.Alpha, a);
+
+            return image;
+        }
+
+        private static void ApplyMaskFromImage(
+            ManagedImage dest,
+            ManagedImage mask)
+        {
+            if (dest == null || mask == null)
+                return;
+
+            if ((dest.Channels &
+                 ManagedImage.ImageChannels.Alpha) == 0)
             {
-                ManagedImage eyeWhite = LoadBakeResource("eyewhite.tga");
-                if (eyeWhite != null)
-                    DrawLayer(baked, eyeWhite, false);
+                dest.ConvertChannels(
+                    dest.Channels |
+                    ManagedImage.ImageChannels.Alpha);
             }
+
+            if (dest.Width != mask.Width ||
+                dest.Height != mask.Height)
+            {
+                try
+                {
+                    mask.ResizeNearestNeighbor(
+                        dest.Width,
+                        dest.Height);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+
+            for (int i = 0; i < dest.Alpha.Length; i++)
+            {
+                byte m =
+                    mask.Alpha != null
+                        ? mask.Alpha[i]
+                        : mask.Red != null
+                            ? mask.Red[i]
+                            : byte.MaxValue;
+
+                dest.Alpha[i] =
+                    (byte)((dest.Alpha[i] * m) >> 8);
+            }
+        }
+
+        private static void ApplyAvatarLadParamAlpha(
+            ManagedImage image,
+            List<AvatarLadParam> parameters,
+            Dictionary<int, float> visualParams)
+        {
+            if (image == null || parameters == null)
+                return;
+
+            foreach (AvatarLadParam parameter in parameters)
+            {
+                AvatarLadAlpha alpha = parameter.Alpha;
+                if (alpha == null ||
+                    string.IsNullOrWhiteSpace(alpha.TgaFile))
+                {
+                    continue;
+                }
+
+                float value =
+                    visualParams.TryGetValue(
+                        parameter.Id,
+                        out float found)
+                        ? found
+                        : parameter.DefaultValue;
+
+                if (alpha.SkipIfZero &&
+                    Math.Abs(value) < 0.00001f)
+                {
+                    continue;
+                }
+
+                ManagedImage mask =
+                    LoadBakeResource(alpha.TgaFile);
+                if (mask == null)
+                    continue;
+
+                if (image.Width != mask.Width ||
+                    image.Height != mask.Height)
+                {
+                    try
+                    {
+                        mask.ResizeNearestNeighbor(
+                            image.Width,
+                            image.Height);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                }
+
+                float normalized =
+                    NormalizeAvatarLadValue(
+                        value,
+                        parameter.MinValue,
+                        parameter.MaxValue);
+
+                byte threshold =
+                    (byte)((1f - normalized) * 255f);
+
+                if ((image.Channels &
+                     ManagedImage.ImageChannels.Alpha) == 0)
+                {
+                    image.ConvertChannels(
+                        image.Channels |
+                        ManagedImage.ImageChannels.Alpha);
+                }
+
+                for (int i = 0;
+                     i < image.Alpha.Length;
+                     i++)
+                {
+                    byte source =
+                        mask.Alpha != null
+                            ? mask.Alpha[i]
+                            : mask.Red != null
+                                ? mask.Red[i]
+                                : byte.MaxValue;
+
+                    byte a =
+                        source <= threshold
+                            ? (byte)0
+                            : byte.MaxValue;
+
+                    if (alpha.MultiplyBlend)
+                    {
+                        image.Alpha[i] =
+                            (byte)((image.Alpha[i] * a) >> 8);
+                    }
+                    else if (a < image.Alpha[i])
+                    {
+                        image.Alpha[i] = a;
+                    }
+                }
+            }
+        }
+
+        private static Color4 EvaluateAvatarLadLayerColor(
+            AvatarLadLayer layer,
+            Dictionary<int, float> visualParams)
+        {
+            Color4 result =
+                layer.FixedColor != null
+                    ? AvatarLadColor(layer.FixedColor)
+                    : Color4.White;
+
+            if (!string.IsNullOrWhiteSpace(
+                    layer.GlobalColor) &&
+                s_avatarLadProfile.Value.GlobalColors.TryGetValue(
+                    layer.GlobalColor,
+                    out List<AvatarLadParam> globalParams))
+            {
+                result =
+                    EvaluateAvatarLadParams(
+                        globalParams,
+                        visualParams,
+                        result);
+            }
+
+            return EvaluateAvatarLadParams(
+                layer.Params,
+                visualParams,
+                result);
+        }
+
+        private static Color4 EvaluateAvatarLadParams(
+            List<AvatarLadParam> parameters,
+            Dictionary<int, float> visualParams,
+            Color4 initial)
+        {
+            Color4 result = initial;
+
+            if (parameters == null)
+                return result;
+
+            foreach (AvatarLadParam parameter in parameters)
+            {
+                AvatarLadColorParam cp = parameter.Color;
+                if (cp?.Values == null ||
+                    cp.Values.Count == 0)
+                {
+                    continue;
+                }
+
+                float value =
+                    visualParams.TryGetValue(
+                        parameter.Id,
+                        out float found)
+                        ? found
+                        : parameter.DefaultValue;
+
+                float normalized =
+                    NormalizeAvatarLadValue(
+                        value,
+                        parameter.MinValue,
+                        parameter.MaxValue);
+
+                Color4 sample =
+                    SampleAvatarLadRamp(
+                        cp.Values,
+                        normalized);
+
+                if (string.Equals(
+                        cp.Operation,
+                        "multiply",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    result = new Color4(
+                        result.R * sample.R,
+                        result.G * sample.G,
+                        result.B * sample.B,
+                        result.A * sample.A);
+                }
+                else
+                {
+                    float a =
+                        Math.Clamp(sample.A, 0f, 1f);
+
+                    result = new Color4(
+                        result.R * (1f - a) +
+                            sample.R * a,
+                        result.G * (1f - a) +
+                            sample.G * a,
+                        result.B * (1f - a) +
+                            sample.B * a,
+                        Math.Max(result.A, sample.A));
+                }
+            }
+
+            return result;
+        }
+
+        private static float NormalizeAvatarLadValue(
+            float value,
+            float min,
+            float max)
+        {
+            if (max <= min)
+                return 0f;
+
+            return Math.Clamp(
+                (value - min) / (max - min),
+                0f,
+                1f);
+        }
+
+        private static Color4 SampleAvatarLadRamp(
+            List<int[]> values,
+            float normalized)
+        {
+            if (values == null ||
+                values.Count == 0)
+            {
+                return Color4.White;
+            }
+
+            if (values.Count == 1)
+                return AvatarLadColor(values[0]);
+
+            float pos =
+                Math.Clamp(normalized, 0f, 1f) *
+                (values.Count - 1);
+
+            int lo = (int)Math.Floor(pos);
+            int hi =
+                Math.Min(
+                    lo + 1,
+                    values.Count - 1);
+
+            float t = pos - lo;
+
+            Color4 a =
+                AvatarLadColor(values[lo]);
+            Color4 b =
+                AvatarLadColor(values[hi]);
+
+            return new Color4(
+                a.R + (b.R - a.R) * t,
+                a.G + (b.G - a.G) * t,
+                a.B + (b.B - a.B) * t,
+                a.A + (b.A - a.A) * t);
+        }
+
+        private static Color4 AvatarLadColor(
+            int[] rgba)
+        {
+            if (rgba == null ||
+                rgba.Length < 4)
+            {
+                return Color4.White;
+            }
+
+            return new Color4(
+                rgba[0] / 255f,
+                rgba[1] / 255f,
+                rgba[2] / 255f,
+                rgba[3] / 255f);
+        }
+
+        private static AvatarLadProfile LoadAvatarLadProfile()
+        {
+            if (!File.Exists(s_avatarLadPath))
+            {
+                throw new FileNotFoundException(
+                    "Novalyth pinned avatar_lad profile missing",
+                    s_avatarLadPath);
+            }
+
+            XDocument document =
+                XDocument.Load(
+                    s_avatarLadPath,
+                    LoadOptions.None);
+
+            XElement root =
+                document.Root ??
+                throw new Exception(
+                    "Novalyth avatar_lad root missing");
+
+            AvatarLadProfile profile = new();
+
+            foreach (XElement global in
+                     root.Elements("global_color"))
+            {
+                string name =
+                    (string)global.Attribute("name") ??
+                    string.Empty;
+
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+
+                List<AvatarLadParam> parameters =
+                    global.Elements("param")
+                        .Select(ParseAvatarLadParam)
+                        .ToList();
+
+                profile.GlobalColors[name] = parameters;
+            }
+
+            foreach (XElement layerSet in
+                     root.Elements("layer_set"))
+            {
+                string rawRegion =
+                    (string)layerSet.Attribute("body_region") ??
+                    string.Empty;
+
+                string region =
+                    NormalizeAvatarLadRegion(rawRegion);
+
+                if (string.IsNullOrEmpty(region))
+                    continue;
+
+                AvatarLadSet set = new()
+                {
+                    Width = ParseAvatarLadInt(
+                        layerSet.Attribute("width"),
+                        region == "eyes" ? 512 : 2048),
+                    Height = ParseAvatarLadInt(
+                        layerSet.Attribute("height"),
+                        region == "eyes" ? 512 : 2048),
+                    ClearAlpha = ParseAvatarLadBool(
+                        layerSet.Attribute("clear_alpha"),
+                        true)
+                };
+
+                int order = 0;
+
+                foreach (XElement layerElement in
+                         layerSet.Elements("layer"))
+                {
+                    AvatarLadLayer layer = new()
+                    {
+                        Order = order++,
+                        Name =
+                            (string)layerElement.Attribute("name") ??
+                            string.Empty,
+                        FixedColor =
+                            ParseAvatarLadColor(
+                                (string)layerElement.Attribute(
+                                    "fixed_color")),
+                        GlobalColor =
+                            (string)layerElement.Attribute(
+                                "global_color") ??
+                            string.Empty,
+                        VisibilityMask =
+                            ParseAvatarLadBool(
+                                layerElement.Attribute(
+                                    "visibility_mask"),
+                                false),
+                        RenderPass =
+                            ((string)layerElement.Attribute(
+                                "render_pass") ??
+                             string.Empty).ToLowerInvariant()
+                    };
+
+                    foreach (XElement textureElement in
+                             layerElement.Elements("texture"))
+                    {
+                        string local =
+                            (string)textureElement.Attribute(
+                                "local_texture") ??
+                            string.Empty;
+
+                        int textureIndex = -1;
+
+                        if (!string.IsNullOrWhiteSpace(local))
+                        {
+                            if (!s_avatarLadLocalTextureIndices.TryGetValue(
+                                    local,
+                                    out textureIndex))
+                            {
+                                throw new Exception(
+                                    "Unknown avatar_lad local_texture: " +
+                                    local);
+                            }
+                        }
+
+                        layer.Textures.Add(
+                            new AvatarLadTexture
+                            {
+                                TextureIndex = textureIndex,
+                                TgaFile =
+                                    (string)textureElement.Attribute(
+                                        "tga_file") ??
+                                    string.Empty,
+                                FileIsMask =
+                                    ParseAvatarLadBool(
+                                        textureElement.Attribute(
+                                            "file_is_mask"),
+                                        false)
+                            });
+                    }
+
+                    foreach (XElement parameterElement in
+                             layerElement.Elements("param"))
+                    {
+                        layer.Params.Add(
+                            ParseAvatarLadParam(
+                                parameterElement));
+                    }
+
+                    set.Layers.Add(layer);
+                }
+
+                profile.Sets[region] = set;
+            }
+
+            string[] required =
+            {
+                "head", "upper", "lower", "eyes",
+                "skirt", "hair", "leftarm",
+                "leftleg", "aux1", "aux2", "aux3"
+            };
+
+            foreach (string slot in required)
+            {
+                if (!profile.Sets.ContainsKey(slot))
+                {
+                    throw new Exception(
+                        "Missing avatar_lad layer_set: " +
+                        slot);
+                }
+            }
+
+            return profile;
+        }
+
+        private static string NormalizeAvatarLadRegion(
+            string region)
+        {
+            return region switch
+            {
+                "upper_body" => "upper",
+                "upper" => "upper",
+                "lower_body" => "lower",
+                "lower" => "lower",
+                "head" => "head",
+                "eyes" => "eyes",
+                "skirt" => "skirt",
+                "hair" => "hair",
+                "leftarm" => "leftarm",
+                "left_arm" => "leftarm",
+                "leftleg" => "leftleg",
+                "left_leg" => "leftleg",
+                "aux1" => "aux1",
+                "aux2" => "aux2",
+                "aux3" => "aux3",
+                _ => string.Empty
+            };
+        }
+
+        private static AvatarLadParam ParseAvatarLadParam(
+            XElement element)
+        {
+            AvatarLadParam parameter = new()
+            {
+                Id = ParseAvatarLadInt(
+                    element.Attribute("id"),
+                    -1),
+                MinValue = ParseAvatarLadFloat(
+                    element.Attribute("value_min"),
+                    0f),
+                MaxValue = ParseAvatarLadFloat(
+                    element.Attribute("value_max"),
+                    1f),
+                DefaultValue = ParseAvatarLadFloat(
+                    element.Attribute("value_default"),
+                    0f)
+            };
+
+            XElement color =
+                element.Element("param_color");
+
+            if (color != null)
+            {
+                AvatarLadColorParam cp = new()
+                {
+                    Operation =
+                        ((string)color.Attribute("operation") ??
+                         "blend").ToLowerInvariant()
+                };
+
+                foreach (XElement value in
+                         color.Elements("value"))
+                {
+                    int[] rgba =
+                        ParseAvatarLadColor(
+                            (string)value.Attribute("color"));
+
+                    if (rgba != null)
+                        cp.Values.Add(rgba);
+                }
+
+                parameter.Color = cp;
+            }
+
+            XElement alpha =
+                element.Element("param_alpha");
+
+            if (alpha != null)
+            {
+                parameter.Alpha =
+                    new AvatarLadAlpha
+                    {
+                        TgaFile =
+                            (string)alpha.Attribute("tga_file") ??
+                            string.Empty,
+                        SkipIfZero =
+                            ParseAvatarLadBool(
+                                alpha.Attribute("skip_if_zero"),
+                                false),
+                        MultiplyBlend =
+                            ParseAvatarLadBool(
+                                alpha.Attribute("multiply_blend"),
+                                false),
+                        Domain =
+                            ParseAvatarLadFloat(
+                                alpha.Attribute("domain"),
+                                0f)
+                    };
+            }
+
+            return parameter;
+        }
+
+        private static int ParseAvatarLadInt(
+            XAttribute attribute,
+            int fallback)
+        {
+            if (attribute == null)
+                return fallback;
+
+            return int.TryParse(
+                attribute.Value,
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out int value)
+                ? value
+                : fallback;
+        }
+
+        private static float ParseAvatarLadFloat(
+            XAttribute attribute,
+            float fallback)
+        {
+            if (attribute == null)
+                return fallback;
+
+            return float.TryParse(
+                attribute.Value,
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out float value)
+                ? value
+                : fallback;
+        }
+
+        private static bool ParseAvatarLadBool(
+            XAttribute attribute,
+            bool fallback)
+        {
+            if (attribute == null)
+                return fallback;
+
+            string value =
+                attribute.Value.Trim();
+
+            return value.Equals(
+                       "true",
+                       StringComparison.OrdinalIgnoreCase) ||
+                   value == "1"
+                ? true
+                : value.Equals(
+                      "false",
+                      StringComparison.OrdinalIgnoreCase) ||
+                  value == "0"
+                    ? false
+                    : fallback;
+        }
+
+        private static int[] ParseAvatarLadColor(
+            string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return null;
+
+            string[] parts =
+                text.Split(
+                    ',',
+                    StringSplitOptions.RemoveEmptyEntries);
+
+            if (parts.Length < 3)
+                return null;
+
+            int[] rgba =
+            {
+                255, 255, 255, 255
+            };
+
+            for (int i = 0;
+                 i < Math.Min(parts.Length, 4);
+                 i++)
+            {
+                if (int.TryParse(
+                        parts[i].Trim(),
+                        NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,
+                        out int value))
+                {
+                    rgba[i] =
+                        Math.Clamp(value, 0, 255);
+                }
+            }
+
+            return rgba;
+        }
+
+        private sealed class AvatarLadProfile
+        {
+            public Dictionary<string, AvatarLadSet> Sets { get; } =
+                new(StringComparer.Ordinal);
+
+            public Dictionary<string, List<AvatarLadParam>>
+                GlobalColors { get; } =
+                    new(StringComparer.Ordinal);
+        }
+
+        private sealed class AvatarLadSet
+        {
+            public int Width;
+            public int Height;
+            public bool ClearAlpha;
+            public List<AvatarLadLayer> Layers { get; } = new();
+        }
+
+        private sealed class AvatarLadLayer
+        {
+            public int Order;
+            public string Name = string.Empty;
+            public int[] FixedColor;
+            public string GlobalColor = string.Empty;
+            public bool VisibilityMask;
+            public string RenderPass = string.Empty;
+            public List<AvatarLadTexture> Textures { get; } = new();
+            public List<AvatarLadParam> Params { get; } = new();
+        }
+
+        private sealed class AvatarLadTexture
+        {
+            public int TextureIndex = -1;
+            public string TgaFile = string.Empty;
+            public bool FileIsMask;
+        }
+
+        private sealed class AvatarLadParam
+        {
+            public int Id = -1;
+            public float MinValue;
+            public float MaxValue = 1f;
+            public float DefaultValue;
+            public AvatarLadColorParam Color;
+            public AvatarLadAlpha Alpha;
+        }
+
+        private sealed class AvatarLadColorParam
+        {
+            public string Operation = "blend";
+            public List<int[]> Values { get; } = new();
+        }
+
+        private sealed class AvatarLadAlpha
+        {
+            public string TgaFile = string.Empty;
+            public bool SkipIfZero;
+            public bool MultiplyBlend;
+            public float Domain;
         }
 
         private static ManagedImage LoadBakeResource(string name)
@@ -1687,7 +2737,7 @@ namespace Novalyth.Server.Appearance
             string j2kHash)
         {
             string canonical =
-                "novalyth-c2b1-bake-asset-v1|" +
+                "novalyth-c2b2-bake-asset-v1|" +
                 recipeHash + "|" + bakeSlot + "|" + j2kHash;
 
             string hex = Convert.ToHexString(
@@ -1732,7 +2782,7 @@ namespace Novalyth.Server.Appearance
                 catch (Exception e)
                 {
                     m_log.ErrorFormat(
-                        "[NOVALYTH APPEARANCE C2B1]: COF version increment failed for {0}: {1}",
+                        "[NOVALYTH APPEARANCE C2B2]: COF version increment failed for {0}: {1}",
                         agentID,
                         e.Message);
                     updated = false;
@@ -1873,7 +2923,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C2B1]: COF content lookup failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B2]: COF content lookup failed for {0}: {1}",
                     agentID,
                     e.Message);
                 error = "cof_read_failed";
@@ -1948,7 +2998,7 @@ namespace Novalyth.Server.Appearance
                         catch (Exception e)
                         {
                             m_log.WarnFormat(
-                                "[NOVALYTH APPEARANCE C2B1]: wearable asset fetch failed {0}: {1}",
+                                "[NOVALYTH APPEARANCE C2B2]: wearable asset fetch failed {0}: {1}",
                                 target.AssetID,
                                 e.Message);
                         }
@@ -2085,8 +3135,8 @@ namespace Novalyth.Server.Appearance
             manifest["missing_source_assets"] = missingSourceArray;
             manifest["source_texture_count"] = sourceLayers.Count;
             manifest["source_audit_status"] = "not_run";
-            manifest["pixel_compositor_status"] = "c2b1_available_on_demand";
-            manifest["compositor_profile"] = "novalyth-c2b1-modern-foundation-v1";
+            manifest["pixel_compositor_status"] = "c2b2_available_on_demand";
+            manifest["compositor_profile"] = "novalyth-c2b2-avatar-lad-v1";
             manifest["bake_asset_store_status"] = "not_run";
             manifest["bake_asset_authority"] = "Asset Core";
             manifest["central_bake_advertised"] = false;
@@ -2301,7 +3351,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.WarnFormat(
-                    "[NOVALYTH APPEARANCE C2B1]: source texture decode failed {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2B2]: source texture decode failed {0}: {1}",
                     textureID,
                     e.Message);
                 return SourceDecodeResult.Fail(e.GetType().Name);

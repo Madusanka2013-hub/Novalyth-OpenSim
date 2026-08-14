@@ -1438,3 +1438,32 @@ Viewer validation:
   Inventory Core process and LIVE are not restarted.
 - C2B2: complete static avatar_lad.xml layer semantics / parity audit.
 - C3: real Firestorm SSA protocol validation; only then enable CentralBakeVersion.
+
+## Appearance Core Phase C2B2 – official avatar_lad semantics (20260814-142356)
+
+- Base commit: `20db566fb56d148312db84670e96ce37cdd55e33`.
+- C2B1 real-avatar bake audit passed with 11/11 stored J2Ks,
+  deterministic output and Asset Core reuse proof.
+- Pinned Second Life viewer commit: `dcff8c97ea5448f0acaff76fa0a74a89889be678`.
+- Pinned official avatar_lad download SHA256: `ace7a7aebac5bee593d2ec2f5a487404cf53859e54537d00e53173c8fa1ee2cd`.
+- Repository-normalized avatar_lad SHA256: `83380dcc2cbc3bce0e74b9429a2da3f7b701756c74248b6edeef6b61c96c20da`.
+- Normalization is whitespace-only (tabs -> spaces, trailing whitespace removed);
+  XML element/attribute content is unchanged.
+- The normalized pinned definition is versioned at `OpenSim/Server/Handlers/BakedTextures/Resources/novalyth_avatar_lad.xml`.
+- Runtime uses a Novalyth-specific copy `openmetaverse_data/novalyth_avatar_lad.xml`;
+  the existing OpenMetaverse avatar_lad.xml is not overwritten.
+- All 11 current layer sets are required at startup.
+- Output dimensions and layer order come from the pinned official definition.
+- Static TGA layers, fixed/global color layers, param-color ramps,
+  param-alpha masks, visibility masks and bump-pass layers are interpreted.
+- Per-wearable local textures still use C2B1 decoded tint and alpha masks.
+- Multiple COF wearables remain independent ordered inputs.
+- `aux_base.tga` is generated as the neutral universal base when absent.
+- C2B2 profile is `novalyth-c2b2-avatar-lad-v1`.
+- C2B2 uses a new deterministic bake-asset namespace.
+- C2B1 manifests are explicitly rejected by the C2B2 reuse path.
+- Bake assets remain authoritative in Asset Core :8110.
+- `CentralBakeVersion` remains disabled.
+- Only Appearance Core is restarted.
+- DEV Region, DEV Robust, Asset Core process, Inventory Core process and LIVE remain untouched.
+- Next: C2B2 real-avatar bake/reuse audit, then C3 Firestorm SSA protocol validation.
