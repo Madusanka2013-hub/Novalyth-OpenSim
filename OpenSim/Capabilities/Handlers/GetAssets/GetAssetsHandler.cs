@@ -31,6 +31,7 @@ using System.Collections.Generic;
 using System.Net;
 using System.Reflection;
 using System.Threading;
+using System.Threading.Tasks;
 using log4net;
 using Nini.Config;
 using OpenMetaverse;
@@ -73,10 +74,12 @@ namespace OpenSim.Capabilities.Handlers
         };
 
         private IAssetService m_assetService;
+        private readonly int m_assetFetchTimeoutMs;
 
-        public GetAssetsHandler(IAssetService assService)
+        public GetAssetsHandler(IAssetService assService, int assetFetchTimeoutMs = 15000)
         {
             m_assetService = assService;
+            m_assetFetchTimeoutMs = Math.Clamp(assetFetchTimeoutMs, 1000, 120000);
         }
 
         public void Handle(OSHttpRequest req, OSHttpResponse response, string serviceURL = null)
@@ -122,17 +125,35 @@ namespace OpenSim.Capabilities.Handlers
             if(!UUID.TryParse(assetStr, out UUID assetID))
                 return;
 
-            ManualResetEventSlim done = new ManualResetEventSlim(false);
-            AssetBase asset = null;
-            m_assetService.Get(assetID.ToString(), serviceURL, false, (AssetBase a) =>
-                {
-                    asset = a;
-                    done.Set();
-                });
+            TaskCompletionSource<AssetBase> completion =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            done.Wait();
-            done.Dispose();
-            done = null;
+            try
+            {
+                m_assetService.Get(assetID.ToString(), serviceURL, false,
+                    (AssetBase a) => completion.TrySetResult(a));
+            }
+            catch (Exception e)
+            {
+                m_log.ErrorFormat(
+                    "[GETASSET]: asset service threw while requesting {0}: {1}",
+                    assetID, e);
+                response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
+                response.KeepAlive = false;
+                return;
+            }
+
+            if (!completion.Task.Wait(m_assetFetchTimeoutMs))
+            {
+                m_log.WarnFormat(
+                    "[GETASSET]: timed out after {0} ms requesting asset {1}",
+                    m_assetFetchTimeoutMs, assetID);
+                response.StatusCode = (int)HttpStatusCode.GatewayTimeout;
+                response.KeepAlive = false;
+                return;
+            }
+
+            AssetBase asset = completion.Task.Result;
 
             if (asset == null)
             {

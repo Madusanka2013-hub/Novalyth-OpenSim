@@ -72,6 +72,8 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
 
         private ObjectJobEngine m_localRequestsQueue;
         private ObjectJobEngine m_remoteRequestsQueue;
+        private int m_localAssetWorkers = 2;
+        private int m_remoteAssetWorkers = 2;
 
         public Type ReplaceableInterface
         {
@@ -105,6 +107,11 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
                         throw new Exception("Region asset connector init error");
                     }
 
+                    m_localAssetWorkers = Math.Clamp(
+                        assetConfig.GetInt("LocalAssetWorkers", 2), 1, 64);
+                    m_remoteAssetWorkers = Math.Clamp(
+                        assetConfig.GetInt("RemoteAssetWorkers", 2), 1, 64);
+
                     string localGridConnector = assetConfig.GetString("LocalGridAssetService", string.Empty);
                     if(string.IsNullOrEmpty(localGridConnector))
                     {
@@ -135,10 +142,14 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
                             m_AssetPerms = new AssetPermissions(hgConfig);
                     }
 
-                    m_localRequestsQueue = new ObjectJobEngine(AssetRequestProcessor, "GetAssetsWorkers", 2000, 2);
-                    m_remoteRequestsQueue = new ObjectJobEngine(AssetRequestProcessor, "GetRemoteAssetsWorkers", 2000, 2);
+                    m_localRequestsQueue = new ObjectJobEngine(
+                        AssetRequestProcessor, "GetAssetsWorkers", 2000, m_localAssetWorkers);
+                    m_remoteRequestsQueue = new ObjectJobEngine(
+                        AssetRequestProcessor, "GetRemoteAssetsWorkers", 2000, m_remoteAssetWorkers);
                     m_Enabled = true;
-                    m_log.Info("[REGIONASSETCONNECTOR]: enabled");
+                    m_log.InfoFormat(
+                        "[REGIONASSETCONNECTOR]: enabled local workers={0}, remote workers={1}",
+                        m_localAssetWorkers, m_remoteAssetWorkers);
                 }
             }
         }
@@ -454,50 +465,65 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
 
         private void AssetRequestProcessor(object o)
         {
-            if( o == null)
+            if (o == null)
                 return;
+
+            AssetBase asset = null;
+            string id = null;
 
             try
             {
-                AssetBase a;
-                string id;
-                if (o is ForeignAssetServiceGetData)
+                if (o is ForeignAssetServiceGetData fasgd)
                 {
-                    var fasgd = (ForeignAssetServiceGetData)o;
                     id = fasgd.id;
-                    a = Get(id, fasgd.ForeignAssetService, fasgd.StoreOnLocalGrid);
+                    asset = Get(id, fasgd.ForeignAssetService, fasgd.StoreOnLocalGrid);
                 }
                 else
                 {
                     id = (string)o;
-                    a = Get(id);
-                }
-
-                List<SimpleAssetRetrieved> handlers;
-                lock (m_AssetHandlers)
-                {
-                    handlers = m_AssetHandlers[id];
-                    m_AssetHandlers.Remove(id);
-                }
-
-                if (handlers != null)
-                {
-                    Util.FireAndForget(x =>
-                    {
-                        foreach (SimpleAssetRetrieved h in handlers)
-                        {
-                            try
-                            {
-                                h.Invoke(a);
-                            }
-                            catch { }
-                        }
-                        handlers.Clear();
-                        a = null;
-                    });
+                    asset = Get(id);
                 }
             }
-            catch { }
+            catch (Exception e)
+            {
+                m_log.ErrorFormat(
+                    "[REGIONASSETCONNECTOR]: asset request failed for {0}: {1}",
+                    id ?? "<unknown>", e);
+            }
+
+            if (string.IsNullOrEmpty(id))
+                return;
+
+            List<SimpleAssetRetrieved> handlers = null;
+            lock (m_AssetHandlers)
+            {
+                if (m_AssetHandlers.TryGetValue(id, out handlers))
+                    m_AssetHandlers.Remove(id);
+            }
+
+            if (handlers == null)
+                return;
+
+            AssetBase callbackAsset = asset;
+            Util.FireAndForget(x =>
+            {
+                foreach (SimpleAssetRetrieved h in handlers)
+                {
+                    try
+                    {
+                        h.Invoke(callbackAsset);
+                    }
+                    catch (Exception e)
+                    {
+                        m_log.WarnFormat(
+                            "[REGIONASSETCONNECTOR]: asset callback failed for {0}: {1}",
+                            id, e.Message);
+                    }
+                }
+
+                handlers.Clear();
+                callbackAsset = null;
+            });
         }
 
         public bool[] AssetsExist(string[] ids)

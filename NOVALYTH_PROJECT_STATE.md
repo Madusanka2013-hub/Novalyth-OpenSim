@@ -295,3 +295,46 @@ Diese Datei muss den Zustand wiedergeben, den ein neuer Chat tatsächlich vorfin
 ## BASELINE-MEILENSTEIN 2026-08-14 – ROBUST
 
 - Robust-Dev-Baseline erfolgreich validiert; HG-Dienste laden fehlerfrei, Listener 8102/8103 binden auf 0.0.0.0; 8103 bleibt strikt privat.
+
+## PERFORMANCE R1 – ASSET PIPELINE
+
+### R1 Stage 1 – Safety and configurability
+
+Implemented in source, pending DEV deployment/test:
+
+- `GetAssetsHandler` no longer performs an unlimited `ManualResetEventSlim.Wait()`.
+- Asset fetch timeout is configurable through `[ClientStack.LindenCaps] Cap_AssetFetchTimeoutMs`.
+- Default timeout is deliberately conservative at 15000 ms for the first DEV measurement.
+- Timeout returns HTTP 504 instead of permanently consuming a CAPS asset worker.
+- Synchronous asset-service exceptions return HTTP 503 and are logged.
+- CAPS asset worker concurrency is configurable with `Cap_AssetWorkers`; default remains upstream-compatible at 3.
+- Region local asset worker concurrency is configurable with `[AssetService] LocalAssetWorkers`; default remains 2.
+- Region HG/remote asset worker concurrency is configurable with `[AssetService] RemoteAssetWorkers`; default remains 2.
+- `RegionAssetConnector.AssetRequestProcessor` now resolves queued callbacks with `null` even when the underlying asset fetch throws, rather than silently swallowing the exception and leaving duplicate/coalesced requests stuck forever.
+- No worker count has been increased yet. We measure first.
+- Important corrected finding: ObjectJobEngine constructor values 1000/2000 are thread hold times in milliseconds, not queue limits. The underlying `BlockingCollection` is currently unbounded.
+- LIVE `/nvme/opensim` is not modified by this source patch.
+
+### R1 next
+
+1. Build/commit through `novalyth-save`.
+2. Deploy this exact commit only to `/nvme/novalyth-opensim-dev`.
+3. Keep defaults 3 CAPS / 2 local / 2 remote for first A/B comparison.
+4. Add queue-depth, timeout, latency and in-flight metrics.
+5. Add controlled backpressure/bounded pending work after baseline data.
+6. Only then test higher worker concurrency.
+
+### Service separation roadmap
+
+OpenSim/Robust already exposes independent service connectors and per-service URIs. Novalyth will use those boundaries rather than inventing incompatible protocols.
+
+Planned coarse-grained services after R1 baseline stability:
+
+1. **Novalyth Asset Service / Asset Edge**
+2. **Novalyth Inventory Service**
+3. **Novalyth Login Edge** — LLLogin/GridInfo public entry point
+4. **Novalyth Identity/Core** — Authentication, UserAccount, GridUser, Presence, Friends, AgentPreferences
+5. **Novalyth Grid/HG** — Grid, map, Gatekeeper, UserAgent and HG-facing connectors
+6. Regions remain independent simulator processes.
+
+Initial split stays on the same physical server over loopback/private ports so process isolation is gained without adding unnecessary network latency.

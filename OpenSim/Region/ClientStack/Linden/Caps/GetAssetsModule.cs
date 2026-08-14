@@ -55,6 +55,8 @@ namespace OpenSim.Region.ClientStack.Linden
 
         private Scene m_scene;
         private bool m_Enabled;
+        private int m_capsAssetWorkers = 3;
+        private int m_assetFetchTimeoutMs = 15000;
 
         private string m_GetTextureURL;
         private string m_GetMeshURL;
@@ -94,6 +96,10 @@ namespace OpenSim.Region.ClientStack.Linden
             IConfig config = source.Configs["ClientStack.LindenCaps"];
             if (config == null)
                 return;
+
+            m_capsAssetWorkers = Math.Clamp(config.GetInt("Cap_AssetWorkers", 3), 1, 64);
+            m_assetFetchTimeoutMs = Math.Clamp(
+                config.GetInt("Cap_AssetFetchTimeoutMs", 15000), 1000, 120000);
 
             m_GetTextureURL = config.GetString("Cap_GetTexture", string.Empty);
             if (m_GetTextureURL != string.Empty)
@@ -141,7 +147,7 @@ namespace OpenSim.Region.ClientStack.Linden
                 {
                     m_assetService = s.RequestModuleInterface<IAssetService>();
                     // We'll reuse the same handler for all requests.
-                    m_getAssetHandler = new GetAssetsHandler(m_assetService);
+                    m_getAssetHandler = new GetAssetsHandler(m_assetService, m_assetFetchTimeoutMs);
                 }
 
                 if (m_assetService == null)
@@ -158,7 +164,13 @@ namespace OpenSim.Region.ClientStack.Linden
                 m_NumberScenes++;
 
                 if (m_workerpool == null)
-                    m_workerpool = new ObjectJobEngine(DoAssetRequests, "GetCapsAssetWorker", 1000, 3);
+                {
+                    m_workerpool = new ObjectJobEngine(
+                        DoAssetRequests, "GetCapsAssetWorker", 1000, m_capsAssetWorkers);
+                    m_log.InfoFormat(
+                        "[GETASSETS]: CAPS asset workers={0}, fetch timeout={1} ms",
+                        m_capsAssetWorkers, m_assetFetchTimeoutMs);
+                }
             }
         }
 
