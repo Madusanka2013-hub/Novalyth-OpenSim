@@ -989,6 +989,7 @@
       <Reference name="OpenSim.Server.Base"/>
       <Reference name="OpenSim.Services.Base"/>
       <Reference name="OpenSim.Services.Interfaces"/>
+      <Reference name="OpenSim.Services.Connectors"/>
       <Reference name="OpenSim.Services.UserAccountService"/>
       <Reference name="XMLRPC"/>
       <Reference name="Nini"/>

@@ -1363,3 +1363,22 @@ Viewer validation:
 - Phase C: server bake compositor, appearance-version advancement, persistent bake manifest, Asset Core integration.
 - Only Appearance Core and DEV Region are restarted for this phase.
 - DEV Robust, Asset Core, Inventory Core and LIVE remain untouched.
+
+## Appearance Core Phase C1 – authoritative COF + SL bake contract + manifest (20260814-123124)
+
+- Base commit: `e03528dddb72342a0e778cbb541abb8a2c572641`.
+- **C1 is intentionally not the pixel compositor. CentralBakeVersion remains disabled.**
+- Current Outfit Folder authority moved to Inventory Core :8120.
+- Appearance Core no longer invents an independent COF version; it reads `FolderType.CurrentOutfit` and its folder version from Inventory Core.
+- `IncrementCofVersion` is the primary current-SL capability spelling; historical `IncrementCOFVersion` remains as an alias.
+- Appearance Core builds a deterministic, persistent bake recipe from COF links and resolved inventory items.
+- Wearable asset existence is checked against Asset Core :8110 before the recipe is marked complete.
+- Persistent manifests live under `/nvme/novalyth-opensim-dev/appearance-manifests`.
+- Bake contract `sl-current-11-v1` defines 11 current SL bake slots:
+  `head, upper, lower, eyes, skirt, hair, leftarm, leftleg, aux1, aux2, aux3`.
+- Each manifest records COF folder/version, recipe hash, ordered wearable contributors, attachments, broken links, missing assets, and all 11 pending bake slots.
+- Recipe hash is deterministic SHA-256 over the authoritative COF recipe.
+- Phase C2 will parse wearable assets/source texture IDs, decode source JPEG2000, composite layers, encode 11 bake outputs as needed, and store them in Asset Core.
+- Phase C3 will validate real Firestorm SSA end-to-end and only then advertise RegionProtocols bit 0 / CentralBakeVersion.
+- Only Appearance Core and DEV Region are restarted for C1.
+- DEV Robust, Asset Core, Inventory Core and LIVE remain untouched.

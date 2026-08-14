@@ -64,15 +64,15 @@ namespace Novalyth.Region.Appearance
                  string.IsNullOrWhiteSpace(m_serviceToken)))
             {
                 m_log.Error(
-                    "[NOVALYTH SSA]: disabled because ServiceURI/ServiceToken is missing");
+                    "[NOVALYTH SSA C1]: disabled because ServiceURI/ServiceToken is missing");
                 m_enabled = false;
             }
 
             if (m_advertiseCentralBake)
             {
                 m_log.Warn(
-                    "[NOVALYTH SSA]: AdvertiseCentralBake=True configured, " +
-                    "but Phase B intentionally does not advertise SSA until the server baker exists");
+                    "[NOVALYTH SSA C1]: AdvertiseCentralBake=True configured, " +
+                    "but C1 intentionally does not advertise SSA until the pixel compositor exists");
             }
         }
 
@@ -95,7 +95,8 @@ namespace Novalyth.Region.Appearance
         private void RegisterCaps(UUID agentID, Caps caps)
         {
             string updatePath = "/" + UUID.Random();
-            string incrementPath = "/" + UUID.Random();
+            string incrementCurrentPath = "/" + UUID.Random();
+            string incrementLegacyPath = "/" + UUID.Random();
 
             caps.RegisterSimpleHandler(
                 "UpdateAvatarAppearance",
@@ -104,15 +105,24 @@ namespace Novalyth.Region.Appearance
                     (request, response) =>
                         ProxyUpdateAvatarAppearance(agentID, request, response)));
 
+            // Current official Second Life viewer spelling.
+            caps.RegisterSimpleHandler(
+                "IncrementCofVersion",
+                new SimpleStreamHandler(
+                    incrementCurrentPath,
+                    (request, response) =>
+                        ProxyIncrementCofVersion(agentID, request, response)));
+
+            // Historical spelling kept as a compatibility alias.
             caps.RegisterSimpleHandler(
                 "IncrementCOFVersion",
                 new SimpleStreamHandler(
-                    incrementPath,
+                    incrementLegacyPath,
                     (request, response) =>
-                        ProxyIncrementCOFVersion(agentID, request, response)));
+                        ProxyIncrementCofVersion(agentID, request, response)));
 
             m_log.InfoFormat(
-                "[NOVALYTH SSA]: registered SL appearance caps for {0}; CentralBakeVersion remains disabled",
+                "[NOVALYTH SSA C1]: registered UpdateAvatarAppearance + IncrementCofVersion + legacy IncrementCOFVersion for {0}; CentralBakeVersion remains disabled",
                 agentID);
         }
 
@@ -164,8 +174,9 @@ namespace Novalyth.Region.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH SSA]: UpdateAvatarAppearance proxy failed for {0}: {1}",
-                    agentID, e.Message);
+                    "[NOVALYTH SSA C1]: UpdateAvatarAppearance proxy failed for {0}: {1}",
+                    agentID,
+                    e.Message);
 
                 WriteViewerError(
                     response,
@@ -174,7 +185,7 @@ namespace Novalyth.Region.Appearance
             }
         }
 
-        private void ProxyIncrementCOFVersion(
+        private void ProxyIncrementCofVersion(
             UUID agentID,
             IOSHttpRequest request,
             IOSHttpResponse response)
@@ -211,8 +222,9 @@ namespace Novalyth.Region.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH SSA]: IncrementCOFVersion proxy failed for {0}: {1}",
-                    agentID, e.Message);
+                    "[NOVALYTH SSA C1]: IncrementCofVersion proxy failed for {0}: {1}",
+                    agentID,
+                    e.Message);
 
                 WriteViewerError(
                     response,
@@ -226,7 +238,7 @@ namespace Novalyth.Region.Appearance
             HttpStatusCode status,
             string error)
         {
-            OSDMap map = new OSDMap();
+            OSDMap map = new();
             map["success"] = false;
             map["error"] = error;
 
