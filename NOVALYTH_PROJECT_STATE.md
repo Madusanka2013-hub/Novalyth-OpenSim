@@ -238,26 +238,40 @@ Die isolierte Novalyth-Dev-Runtime ist eingerichtet:
 - Der erste Startfehler durch fehlende `HomeURI`/`GatekeeperURI` wurde ausschließlich in der Dev-Runtime-Konfiguration korrigiert.
 - LIVE `/nvme/opensim` blieb unverändert.
 
+## PUBLIC DEV ACCESS STATUS
+
+Öffentlicher DEV-Viewer-Zugang ist vorbereitet:
+
+- Public DEV Robust: `http://23.88.2.228:8102`
+- Robust Private: `8103` — **explizit per UFW DENY und niemals öffentlich**
+- Region `Novalyth Dev Lab`: `23.88.2.228:9100`
+- Region `InternalAddress = 0.0.0.0` für externes UDP
+- Region `ExternalHostName = 23.88.2.228`
+- Region-Prozess benutzt für private Grid-Dienste weiterhin `http://127.0.0.1:8103`
+- UFW erlaubt nur:
+  - `8102/tcp`
+  - `9100/tcp`
+  - `9100/udp`
+- LIVE `/nvme/opensim` bleibt unverändert.
+
 ## 8. CURRENT NEXT ACTION
 
-**Region-Baseline kontrolliert starten.**
+**Öffentlichen DEV-Baseline-Test durchführen.**
 
-1. Robust weiterlaufen lassen.
-2. In einer zweiten SSH-Session `novalyth-dev-region` starten.
-3. Eventuelle Estate-/Owner-Erstinitialisierung bewusst beantworten.
-4. Prüfen:
-   - CWD `/nvme/novalyth-opensim-dev/bin`
-   - Region `Novalyth Dev Lab`
-   - Grid-Position `1100,1100`
-   - Port `9100`
-   - ausschließlich DB `novalyth_region_dev`
-5. In weiterer Shell:
-   - `ss -lunp | grep -E ':(9100)'`
-   - `ss -ltnp | grep -E ':(9100)'`
-6. Region-Log auf `ERROR|Exception|Failed|Fatal` prüfen.
-7. Erst wenn Robust + Region sauber laufen, Firewall-/öffentlichen DEV-Viewer-Zugang planen.
-8. Port `8103` bleibt dauerhaft privat.
-9. Danach Baseline-Messungen erfassen und anschließend **PERFORMANCE R1 – Asset Pipeline** beginnen.
+1. DEV-Robust starten: `novalyth-dev-robust`
+2. DEV-Region starten: `novalyth-dev-region`
+3. Listener prüfen:
+   - TCP `8102`
+   - TCP `8103`
+   - TCP/UDP `9100`
+4. Sicherstellen, dass UDP `9100` nicht mehr nur auf `127.0.0.1` gebunden ist.
+5. Von extern prüfen:
+   - Login/Grid URI: `http://23.88.2.228:8102`
+6. Mit dem DEV-Account in Firestorm einloggen.
+7. Region `Novalyth Dev Lab` betreten und Basisfunktionen testen.
+8. Verifizieren, dass `8103` extern nicht erreichbar ist.
+9. Erst nach erfolgreichem externem Baseline-Test Messwerte erfassen.
+10. Danach **PERFORMANCE R1 – Asset Pipeline** beginnen.
 
 ## 9. Pflegepflicht
 
