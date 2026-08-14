@@ -34,6 +34,7 @@ using OpenSim.Server.Base;
 using OpenSim.Services.Interfaces;
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net.Http;
 using System.Reflection;
@@ -65,6 +66,22 @@ namespace OpenSim.Services.Connectors
 
         private const double CACHE_EXPIRATION_SECONDS = 30.0;
         private static readonly ExpiringCacheOS<UUID, InventoryItemBase> m_ItemCache = new(15000);
+
+        // NOVALYTH R2: short-lived folder response cache plus single-flight
+        // request coalescing before calls reach the dedicated Inventory Core.
+        private static readonly ExpiringCacheOS<string, InventoryCollection> m_FolderContentCache = new(20000);
+        private static readonly ConcurrentDictionary<string, System.Lazy<InventoryCollection>> m_FolderContentInFlight = new();
+        private static readonly ConcurrentDictionary<string, System.Lazy<InventoryCollection[]>> m_MultiFolderContentInFlight = new();
+        private static readonly ConcurrentDictionary<string, long> m_FolderContentGeneration = new();
+        private static long m_FolderContentGlobalGeneration;
+
+        private double m_FolderContentCacheSeconds = 0.5;
+        private bool m_FolderContentCoalescing = true;
+
+        private long m_FolderContentCacheHits;
+        private long m_FolderContentCoalescedWaits;
+        private int m_FolderCacheHitLogOnce;
+        private int m_FolderCoalescedLogOnce;
 
         public XInventoryServicesConnector()
         {
@@ -113,6 +130,17 @@ namespace OpenSim.Services.Connectors
                 m_InventoryURL = serviceURI + "/xinventory";
 
              m_requestTimeout = 1000 * config.GetInt("RemoteRequestTimeout", -1);
+
+            m_FolderContentCacheSeconds =
+                Math.Clamp(config.GetDouble("FolderContentCacheSeconds", 0.5), 0.0, 5.0);
+            m_FolderContentCoalescing =
+                config.GetBoolean("FolderContentCoalescing", true);
+
+            m_log.InfoFormat(
+                "[NOVALYTH INVENTORY REMOTE]: folder-cache ttl={0:0.000}s coalescing={1} endpoint={2}",
+                m_FolderContentCacheSeconds,
+                m_FolderContentCoalescing,
+                m_InventoryURL);
 
             StatsManager.RegisterStat(
                 new Stat(
@@ -200,8 +228,132 @@ namespace OpenSim.Services.Connectors
 
         public InventoryCollection GetFolderContent(UUID principalID, UUID folderID)
         {
+            string generationKey = GetFolderContentGenerationKey(principalID);
+            string cacheKey = GetFolderContentCacheKey(generationKey, folderID);
+
+            if (TryGetFolderContentCache(cacheKey, out InventoryCollection cached))
+                return cached;
+
+            if (!m_FolderContentCoalescing)
+            {
+                InventoryCollection direct = FetchFolderContentRemote(principalID, folderID);
+                StoreFolderContentCache(cacheKey, direct);
+                return CloneInventoryCollection(direct);
+            }
+
+            System.Lazy<InventoryCollection> mine = new(
+                () => FetchFolderContentRemote(principalID, folderID),
+                System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
+
+            System.Lazy<InventoryCollection> shared =
+                m_FolderContentInFlight.GetOrAdd(cacheKey, mine);
+
+            if (!ReferenceEquals(shared, mine))
+                NoteFolderContentCoalesced();
+
+            try
+            {
+                InventoryCollection result = shared.Value;
+                StoreFolderContentCache(cacheKey, result);
+                return CloneInventoryCollection(result);
+            }
+            finally
+            {
+                if (ReferenceEquals(shared, mine))
+                    m_FolderContentInFlight.TryRemove(cacheKey, out _);
+            }
+        }
+
+        public virtual InventoryCollection[] GetMultipleFoldersContent(UUID principalID, UUID[] folderIDs)
+        {
+            if (folderIDs == null || folderIDs.Length == 0)
+                return [];
+
+            string generationKey = GetFolderContentGenerationKey(principalID);
+            InventoryCollection[] result = new InventoryCollection[folderIDs.Length];
+            List<UUID> missingIDs = [];
+            List<int> missingPositions = [];
+
+            for (int i = 0; i < folderIDs.Length; ++i)
+            {
+                string cacheKey = GetFolderContentCacheKey(
+                    generationKey, folderIDs[i]);
+
+                if (TryGetFolderContentCache(cacheKey, out InventoryCollection cached))
+                    result[i] = cached;
+                else
+                {
+                    missingIDs.Add(folderIDs[i]);
+                    missingPositions.Add(i);
+                }
+            }
+
+            if (missingIDs.Count == 0)
+                return result;
+
+            UUID[] requestIDs = missingIDs.ToArray();
+            InventoryCollection[] fetched;
+
+            if (!m_FolderContentCoalescing)
+            {
+                fetched = FetchMultipleFoldersContentRemote(principalID, requestIDs);
+            }
+            else
+            {
+                string inFlightKey =
+                    $"{generationKey}|M|{string.Join(',', requestIDs)}";
+
+                System.Lazy<InventoryCollection[]> mine = new(
+                    () => FetchMultipleFoldersContentRemote(principalID, requestIDs),
+                    System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
+
+                System.Lazy<InventoryCollection[]> shared =
+                    m_MultiFolderContentInFlight.GetOrAdd(inFlightKey, mine);
+
+                if (!ReferenceEquals(shared, mine))
+                    NoteFolderContentCoalesced();
+
+                try
+                {
+                    fetched = shared.Value;
+                }
+                finally
+                {
+                    if (ReferenceEquals(shared, mine))
+                        m_MultiFolderContentInFlight.TryRemove(inFlightKey, out _);
+                }
+            }
+
+            if (fetched == null)
+                return result;
+
+            for (int i = 0; i < fetched.Length && i < missingPositions.Count; ++i)
+            {
+                int target = missingPositions[i];
+                InventoryCollection inventory = fetched[i];
+
+                if (inventory == null)
+                {
+                    result[target] = null;
+                    continue;
+                }
+
+                string cacheKey = GetFolderContentCacheKey(
+                    generationKey, folderIDs[target]);
+
+                StoreFolderContentCache(cacheKey, inventory);
+                result[target] = CloneInventoryCollection(inventory);
+            }
+
+            return result;
+        }
+
+        private InventoryCollection FetchFolderContentRemote(
+            UUID principalID, UUID folderID)
+        {
             InventoryCollection inventory = new()
             {
+                FolderID = folderID,
                 Folders = [],
                 Items = [],
                 OwnerID = principalID
@@ -215,31 +367,50 @@ namespace OpenSim.Services.Connectors
                 if (!CheckReturn(ret))
                     return null;
 
-                if(ret.TryGetValue("FOLDERS", out object ofolders))
+                if (ret.TryGetValue("FID", out object retFID)
+                    && UUID.TryParse((string)retFID, out UUID parsedFolderID))
+                {
+                    inventory.FolderID = parsedFolderID;
+                }
+
+                if (ret.TryGetValue("VERSION", out object retVer)
+                    && Int32.TryParse((string)retVer, out int parsedVersion))
+                {
+                    inventory.Version = parsedVersion;
+                }
+
+                if (ret.TryGetValue("FOLDERS", out object ofolders))
                 {
                     var folders = (Dictionary<string, object>)ofolders;
-                    foreach (object o in folders.Values) // getting the values directly, we don't care about the keys folder_i
-                        inventory.Folders.Add(BuildFolder((Dictionary<string, object>)o));
+                    foreach (object o in folders.Values)
+                        inventory.Folders.Add(
+                            BuildFolder((Dictionary<string, object>)o));
                 }
-                if(ret.TryGetValue("ITEMS", out object oitems))
+
+                if (ret.TryGetValue("ITEMS", out object oitems))
                 {
                     var items = (Dictionary<string, object>)oitems;
-                    foreach (object o in items.Values) // getting the values directly, we don't care about the keys item_i
-                        inventory.Items.Add(BuildItem((Dictionary<string, object>)o));
+                    foreach (object o in items.Values)
+                        inventory.Items.Add(
+                            BuildItem((Dictionary<string, object>)o));
                 }
             }
             catch (Exception e)
             {
-                m_log.Warn("[XINVENTORY SERVICES CONNECTOR]: Exception in GetFolderContent: " + e.Message);
+                m_log.Warn(
+                    "[XINVENTORY SERVICES CONNECTOR]: Exception in GetFolderContent: "
+                    + e.Message);
             }
 
             return inventory;
         }
 
-        public virtual InventoryCollection[] GetMultipleFoldersContent(UUID principalID, UUID[] folderIDs)
+        private InventoryCollection[] FetchMultipleFoldersContentRemote(
+            UUID principalID, UUID[] folderIDs)
         {
-            InventoryCollection[] inventoryArr = new InventoryCollection[folderIDs.Length];
-            // m_log.DebugFormat("[XXX]: In GetMultipleFoldersContent {0}", String.Join(",", folderIDs));
+            InventoryCollection[] inventoryArr =
+                new InventoryCollection[folderIDs.Length];
+
             try
             {
                 Dictionary<string, object> resultSet = MakeRequest(
@@ -248,81 +419,204 @@ namespace OpenSim.Services.Connectors
                 if (!CheckReturn(resultSet))
                     return null;
 
-                int i = 0;
-                foreach (UUID u in folderIDs.AsSpan())
+                for (int i = 0; i < folderIDs.Length; ++i)
                 {
-                    if(resultSet.TryGetValue($"F_{u}", out object oret) && oret is Dictionary<string, object> ret)
-                    {
-                        UUID inventoryFolderID;
-                        if (ret.TryGetValue("FID", out object retFID))
-                        {
-                            if (!UUID.TryParse((string)retFID, out inventoryFolderID))
-                            {
-                                m_log.WarnFormat("[XINVENTORY SERVICES CONNECTOR]: Could not parse folder id {0}", retFID.ToString());
-                                inventoryArr[i] = null;
-                                continue;
-                            }
-                        }
-                        else
-                        {
-                            inventoryArr[i] = null;
-                            m_log.WarnFormat("[XINVENTORY SERVICES CONNECTOR]: FID key not present in response");
-                            continue;
-                        }
+                    UUID requestedID = folderIDs[i];
 
-                        if (!ret.TryGetValue("OWNER", out object retOwner) || 
-                            !UUID.TryParse((string)retOwner, out UUID inventoryOwnerID))
-                        {
-                            inventoryArr[i] = null;
-                            m_log.Warn($"[XINVENTORY SERVICES CONNECTOR]: Could not parse folder {retFID} owner id");
-                            continue;
-                        }
-
-                        InventoryCollection inventory = new()
-                        {
-                            FolderID = inventoryFolderID,
-                            OwnerID = inventoryOwnerID,
-                            Folders = [],
-                            Items = []
-                        };
-
-                        if (!ret.TryGetValue("VERSION", out object retVer) ||
-                                !Int32.TryParse((string)retVer, out inventory.Version))
-                            inventory.Version = -1;
-
-                        //m_log.DebugFormat("[XXX]: Received {0} ({1}) {2} {3}", inventory.FolderID, fid, inventory.Version, inventory.OwnerID);
-
-                        if (ret.TryGetValue("FOLDERS", out object ofolders) && ofolders is Dictionary<string, object> folders)
-                        {
-                            foreach (object o in folders.Values) // getting the values directly, we don't care about the keys folder_i
-                            {
-                                inventory.Folders.Add(BuildFolder((Dictionary<string, object>)o));
-                            }
-                        }
-
-                        if (ret.TryGetValue("ITEMS", out object oitems) && oitems is Dictionary<string, object> items)
-                        {
-                            foreach (object o in items.Values) // getting the values directly, we don't care about the keys item_i
-                            {
-                                inventory.Items.Add(BuildItem((Dictionary<string, object>)o));
-                            }
-                        }
-                        inventoryArr[i] = inventory;
-                    }
-                    else
+                    if (!resultSet.TryGetValue(
+                            $"F_{requestedID}", out object oret)
+                        || oret is not Dictionary<string, object> ret)
                     {
                         inventoryArr[i] = null;
-                        //m_log.Warn($"[XINVENTORY SERVICES CONNECTOR]: Folder {folderIDs[i]} not on reply");,
+                        continue;
                     }
-                    i++;
+
+                    if (!ret.TryGetValue("FID", out object retFID)
+                        || !UUID.TryParse(
+                            (string)retFID, out UUID inventoryFolderID))
+                    {
+                        inventoryArr[i] = null;
+                        continue;
+                    }
+
+                    if (!ret.TryGetValue("OWNER", out object retOwner)
+                        || !UUID.TryParse(
+                            (string)retOwner, out UUID inventoryOwnerID))
+                    {
+                        inventoryArr[i] = null;
+                        continue;
+                    }
+
+                    InventoryCollection inventory = new()
+                    {
+                        FolderID = inventoryFolderID,
+                        OwnerID = inventoryOwnerID,
+                        Folders = [],
+                        Items = []
+                    };
+
+                    if (!ret.TryGetValue("VERSION", out object retVer)
+                        || !Int32.TryParse(
+                            (string)retVer, out inventory.Version))
+                    {
+                        inventory.Version = -1;
+                    }
+
+                    if (ret.TryGetValue("FOLDERS", out object ofolders)
+                        && ofolders is Dictionary<string, object> folders)
+                    {
+                        foreach (object o in folders.Values)
+                            inventory.Folders.Add(
+                                BuildFolder((Dictionary<string, object>)o));
+                    }
+
+                    if (ret.TryGetValue("ITEMS", out object oitems)
+                        && oitems is Dictionary<string, object> items)
+                    {
+                        foreach (object o in items.Values)
+                            inventory.Items.Add(
+                                BuildItem((Dictionary<string, object>)o));
+                    }
+
+                    inventoryArr[i] = inventory;
                 }
             }
             catch (Exception e)
             {
-                m_log.Warn("[XINVENTORY SERVICES CONNECTOR]: Exception in GetMultipleFoldersContent: {0}" + e.Message);
+                m_log.WarnFormat(
+                    "[XINVENTORY SERVICES CONNECTOR]: Exception in GetMultipleFoldersContent: {0}",
+                    e.Message);
             }
 
             return inventoryArr;
+        }
+
+        private string GetFolderContentGenerationKey(UUID principalID)
+        {
+            long globalGeneration =
+                Interlocked.Read(ref m_FolderContentGlobalGeneration);
+
+            long userGeneration =
+                m_FolderContentGeneration.GetOrAdd(
+                    $"{m_InventoryURL}|{principalID}", 0);
+
+            return $"{m_InventoryURL}|G{globalGeneration}|{principalID}|U{userGeneration}";
+        }
+
+        private static string GetFolderContentCacheKey(
+            string generationKey, UUID folderID)
+        {
+            return $"{generationKey}|{folderID}";
+        }
+
+        private void InvalidateFolderContentCache(UUID principalID)
+        {
+            string key = $"{m_InventoryURL}|{principalID}";
+
+            m_FolderContentGeneration.AddOrUpdate(
+                key,
+                1,
+                static (_, current) => unchecked(current + 1));
+        }
+
+        private static void InvalidateAllFolderContentCache()
+        {
+            Interlocked.Increment(ref m_FolderContentGlobalGeneration);
+        }
+
+        private bool TryGetFolderContentCache(
+            string cacheKey, out InventoryCollection inventory)
+        {
+            inventory = null;
+
+            if (m_FolderContentCacheSeconds <= 0)
+                return false;
+
+            if (!m_FolderContentCache.TryGetValue(
+                    cacheKey, out InventoryCollection cached))
+            {
+                return false;
+            }
+
+            Interlocked.Increment(ref m_FolderContentCacheHits);
+
+            if (Interlocked.Exchange(ref m_FolderCacheHitLogOnce, 1) == 0)
+            {
+                m_log.InfoFormat(
+                    "[NOVALYTH INVENTORY REMOTE]: folder-cache HIT; hits={0}",
+                    Interlocked.Read(ref m_FolderContentCacheHits));
+            }
+
+            inventory = CloneInventoryCollection(cached);
+            return true;
+        }
+
+        private void StoreFolderContentCache(
+            string cacheKey, InventoryCollection inventory)
+        {
+            if (inventory == null || m_FolderContentCacheSeconds <= 0)
+                return;
+
+            m_FolderContentCache.AddOrUpdate(
+                cacheKey,
+                CloneInventoryCollection(inventory),
+                m_FolderContentCacheSeconds);
+        }
+
+        private void NoteFolderContentCoalesced()
+        {
+            Interlocked.Increment(ref m_FolderContentCoalescedWaits);
+
+            if (Interlocked.Exchange(ref m_FolderCoalescedLogOnce, 1) == 0)
+            {
+                m_log.InfoFormat(
+                    "[NOVALYTH INVENTORY REMOTE]: request COALESCED; waits={0}",
+                    Interlocked.Read(ref m_FolderContentCoalescedWaits));
+            }
+        }
+
+        private static InventoryCollection CloneInventoryCollection(
+            InventoryCollection source)
+        {
+            if (source == null)
+                return null;
+
+            InventoryCollection clone = new()
+            {
+                OwnerID = source.OwnerID,
+                FolderID = source.FolderID,
+                Version = source.Version,
+                Descendents = source.Descendents,
+                Folders = source.Folders == null
+                    ? null
+                    : new List<InventoryFolderBase>(source.Folders.Count),
+                Items = source.Items == null
+                    ? null
+                    : new List<InventoryItemBase>(source.Items.Count)
+            };
+
+            if (source.Folders != null)
+            {
+                foreach (InventoryFolderBase folder in source.Folders)
+                {
+                    clone.Folders.Add(
+                        new InventoryFolderBase(
+                            folder.ID,
+                            folder.Name,
+                            folder.Owner,
+                            folder.Type,
+                            folder.ParentID,
+                            folder.Version));
+                }
+            }
+
+            if (source.Items != null)
+            {
+                foreach (InventoryItemBase item in source.Items)
+                    clone.Items.Add((InventoryItemBase)item.Clone());
+            }
+
+            return clone;
         }
 
         public List<InventoryItemBase> GetFolderItems(UUID principalID, UUID folderID)
@@ -669,8 +963,10 @@ namespace OpenSim.Services.Connectors
         private Dictionary<string, object> MakeRequest(Dictionary<string, object> sendData)
         {
             RequestsMade++;
-            Dictionary<string, object> replyData = MakePostDicRequest(ServerUtils.BuildQueryString(sendData));
+            Dictionary<string, object> replyData =
+                MakePostDicRequest(ServerUtils.BuildQueryString(sendData));
 
+            MaybeInvalidateFolderContentCache(sendData, replyData);
             return replyData;
         }
 
@@ -679,7 +975,85 @@ namespace OpenSim.Services.Connectors
             RequestsMade++;
             Dictionary<string, object> replyData = MakePostDicRequest(query);
 
+            MaybeInvalidateFolderContentCache(query, replyData);
             return replyData;
+        }
+
+        private void MaybeInvalidateFolderContentCache(
+            Dictionary<string, object> sendData,
+            Dictionary<string, object> replyData)
+        {
+            if (!CheckReturn(replyData)
+                || !sendData.TryGetValue("METHOD", out object methodObject))
+            {
+                return;
+            }
+
+            string method = methodObject?.ToString();
+            if (!IsInventoryWriteMethod(method))
+                return;
+
+            if (TryGetPrincipal(sendData, out UUID principalID))
+                InvalidateFolderContentCache(principalID);
+            else
+                InvalidateAllFolderContentCache();
+        }
+
+        private void MaybeInvalidateFolderContentCache(
+            string query,
+            Dictionary<string, object> replyData)
+        {
+            if (!CheckReturn(replyData) || string.IsNullOrEmpty(query))
+                return;
+
+            var parsed = HttpUtility.ParseQueryString(query);
+            string method = parsed["METHOD"];
+
+            if (!IsInventoryWriteMethod(method))
+                return;
+
+            string principal =
+                parsed["PRINCIPAL"]
+                ?? parsed["Owner"]
+                ?? parsed["OWNER"];
+
+            if (UUID.TryParse(principal, out UUID principalID))
+                InvalidateFolderContentCache(principalID);
+            else
+                InvalidateAllFolderContentCache();
+        }
+
+        private static bool TryGetPrincipal(
+            Dictionary<string, object> sendData, out UUID principalID)
+        {
+            principalID = UUID.Zero;
+
+            string[] keys = ["PRINCIPAL", "Owner", "OWNER"];
+
+            foreach (string key in keys)
+            {
+                if (sendData.TryGetValue(key, out object value)
+                    && UUID.TryParse(value?.ToString(), out principalID))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsInventoryWriteMethod(string method)
+        {
+            if (string.IsNullOrEmpty(method))
+                return false;
+
+            return method.StartsWith("CREATE", StringComparison.Ordinal)
+                || method.StartsWith("ADD", StringComparison.Ordinal)
+                || method.StartsWith("UPDATE", StringComparison.Ordinal)
+                || method.StartsWith("MOVE", StringComparison.Ordinal)
+                || method.StartsWith("DELETE", StringComparison.Ordinal)
+                || method.StartsWith("PURGE", StringComparison.Ordinal)
+                || method.StartsWith("SET", StringComparison.Ordinal);
         }
 
         private static InventoryFolderBase BuildFolder(Dictionary<string,object> data)

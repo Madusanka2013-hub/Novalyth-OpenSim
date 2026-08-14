@@ -965,3 +965,40 @@ Next:
 
 - inventory request coalescing / short-lived folder cache;
 - bounded concurrency and worker/fairness controls only after reducing duplicate work.
+
+## R2 Inventory Performance – Remote Folder Cache + Coalescing
+
+Status: **DEV RUNTIME VALIDATED**
+
+Date: 2026-08-14
+
+Implementation:
+
+- short-lived folder-content cache in `XInventoryServicesConnector`;
+- default TTL `0.5s`, configurable with `FolderContentCacheSeconds` and clamped to `0..5s`;
+- identical concurrent single-folder reads use single-flight request coalescing;
+- identical concurrent missing subsets of multi-folder reads use single-flight coalescing;
+- multi-folder calls satisfy cached folders first and send only misses to Inventory Core;
+- cached `InventoryCollection` results are defensively cloned;
+- successful inventory writes centrally invalidate the current user's cache generation;
+- writes without a resolvable principal invalidate a process-wide generation;
+- cross-process staleness remains bounded by the deliberately short TTL;
+- existing 30-second item cache remains unchanged;
+- Inventory Core native DB batching remains unchanged.
+
+Validation:
+
+- build succeeded before runtime deployment;
+- new connector loaded in DEV Robust and DEV Region;
+- two real identical `GETFOLDERCONTENT` requests through `8103` returned identical responses;
+- runtime folder cache hit observed;
+- 64 parallel functional requests returned HTTP 200;
+- runtime single-flight observation: `YES`;
+- Inventory Core 8120 and Asset Core 8110 were not restarted;
+- DEV Robust and DEV Region returned healthy;
+- LIVE `/nvme/opensim` remained untouched.
+
+Next:
+
+- bounded remote Inventory request concurrency and fairness;
+- tune workers only after batching/cache/coalescing have removed duplicate work.
