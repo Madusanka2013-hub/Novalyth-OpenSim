@@ -88,7 +88,7 @@ namespace OpenSim.Data.MySQL
             if (folder.folderName.Length > 64)
                 folder.folderName = folder.folderName.Substring(0, 64);
 
-            return m_Folders.Store(folder);
+            return m_Folders.StoreTransactional(folder);
         }
 
         public bool StoreItem(XInventoryItem item)
@@ -98,7 +98,7 @@ namespace OpenSim.Data.MySQL
             if (item.inventoryDescription.Length > 128)
                 item.inventoryDescription = item.inventoryDescription[..128];
 
-            return m_Items.Store(item);
+            return m_Items.StoreTransactional(item);
         }
 
         public bool DeleteFolders(string field, string val)
@@ -113,22 +113,22 @@ namespace OpenSim.Data.MySQL
 
         public bool DeleteItems(string field, string val)
         {
-            return m_Items.Delete(field, val);
+            return m_Items.DeleteTransactional(field, val);
         }
 
         public bool DeleteItems(string[] fields, string[] vals)
         {
-            return m_Items.Delete(fields, vals);
+            return m_Items.DeleteTransactional(fields, vals);
         }
 
         public bool MoveItem(string id, string newParent)
         {
-            return m_Items.MoveItem(id, newParent);
+            return m_Items.MoveItemTransactional(id, newParent);
         }
 
         public bool MoveFolder(string id, string newParent)
         {
-            return m_Folders.MoveFolder(id, newParent);
+            return m_Folders.MoveFolderTransactional(id, newParent);
         }
 
         public XInventoryItem[] GetActiveGestures(UUID principalID)
@@ -150,19 +150,42 @@ namespace OpenSim.Data.MySQL
         {
         }
 
+        private MySqlItemHandler(MySqlTransaction trans, string realm)
+            : base(trans, realm, string.Empty)
+        {
+        }
+
+        public bool StoreTransactional(XInventoryItem item)
+        {
+            return ExecuteInTransaction(
+                trans => new MySqlItemHandler(trans, m_Realm).Store(item));
+        }
+
+        public bool DeleteTransactional(string field, string val)
+        {
+            return ExecuteInTransaction(
+                trans => new MySqlItemHandler(trans, m_Realm).Delete(field, val));
+        }
+
+        public bool DeleteTransactional(string[] fields, string[] vals)
+        {
+            return ExecuteInTransaction(
+                trans => new MySqlItemHandler(trans, m_Realm).Delete(fields, vals));
+        }
+
+        public bool MoveItemTransactional(string id, string newParent)
+        {
+            return ExecuteInTransaction(
+                trans => new MySqlItemHandler(trans, m_Realm).MoveItem(id, newParent));
+        }
+
         public override bool Delete(string field, string val)
         {
-            XInventoryItem[] retrievedItems = Get(new string[] { field }, new string[] { val });
-            if (retrievedItems.Length == 0)
-                return false;
-
-            if (!base.Delete(field, val))
-                return false;
-
-            // Don't increment folder version here since Delete(string, string) calls Delete(string[], string[])
-            //IncrementFolderVersion(retrievedItems[0].parentFolderID);
-
-            return true;
+            // The array overload already performs the existence read, delete,
+            // and folder-version update. Calling base.Delete(field, val) here
+            // dispatches back to that overload and used to duplicate the first
+            // SELECT.
+            return Delete([field], [val]);
         }
 
         public override bool Delete(string[] fields, string[] vals)
@@ -275,6 +298,23 @@ namespace OpenSim.Data.MySQL
         {
         }
 
+        private MySqlFolderHandler(MySqlTransaction trans, string realm)
+            : base(trans, realm, string.Empty)
+        {
+        }
+
+        public bool StoreTransactional(XInventoryFolder folder)
+        {
+            return ExecuteInTransaction(
+                trans => new MySqlFolderHandler(trans, m_Realm).Store(folder));
+        }
+
+        public bool MoveFolderTransactional(string id, string newParentFolderID)
+        {
+            return ExecuteInTransaction(
+                trans => new MySqlFolderHandler(trans, m_Realm).MoveFolder(id, newParentFolderID));
+        }
+
         public bool MoveFolder(string id, string newParentFolderID)
         {
             XInventoryFolder[] folders = Get(new string[] { "folderID" }, new string[] { id });
@@ -313,7 +353,63 @@ namespace OpenSim.Data.MySQL
 
     public class MySqlInventoryHandler<T> : MySQLGenericTableHandler<T> where T: class, new()
     {
+        private static readonly ILog m_log =
+            LogManager.GetLogger(typeof(MySqlInventoryHandler<T>));
+
+        private static int m_TransactionLogOnce;
+
         public MySqlInventoryHandler(string c, string t, string m) : base(c, t, m) {}
+
+        protected MySqlInventoryHandler(
+            MySqlTransaction trans,
+            string realm,
+            string storeName) : base(trans, realm, storeName)
+        {
+        }
+
+        protected bool ExecuteInTransaction(
+            Func<MySqlTransaction, bool> action)
+        {
+            if (m_trans != null)
+                return action(m_trans);
+
+            using MySqlConnection dbcon = new(m_connectionString);
+            dbcon.Open();
+
+            using MySqlTransaction trans = dbcon.BeginTransaction();
+
+            try
+            {
+                if (System.Threading.Interlocked.Exchange(
+                        ref m_TransactionLogOnce, 1) == 0)
+                {
+                    m_log.InfoFormat(
+                        "[NOVALYTH INVENTORY MYSQL]: transactional mutation path active; row-type={0}",
+                        typeof(T).Name);
+                }
+
+                bool result = action(trans);
+
+                if (result)
+                    trans.Commit();
+                else
+                    trans.Rollback();
+
+                return result;
+            }
+            catch
+            {
+                try
+                {
+                    trans.Rollback();
+                }
+                catch
+                {
+                }
+
+                throw;
+            }
+        }
 
         protected bool IncrementFolderVersion(UUID folderID)
         {
@@ -322,34 +418,15 @@ namespace OpenSim.Data.MySQL
 
         protected bool IncrementFolderVersion(string folderID)
         {
-            //m_log.DebugFormat("[MYSQL FOLDER HANDLER]: Incrementing version on folder {0}", folderID);
-            //Util.PrintCallStack();
+            // Route through MySqlFramework so a transactional handler reuses
+            // the same connection/transaction as the mutation itself.
+            using MySqlCommand cmd = new();
 
-            using (MySqlConnection dbcon = new(m_connectionString))
-            {
-                dbcon.Open();
+            cmd.CommandText =
+                "update inventoryfolders set version=version+1 where folderID = ?folderID";
+            cmd.Parameters.AddWithValue("?folderID", folderID);
 
-                using (MySqlCommand cmd = new())
-                {
-                    cmd.Connection = dbcon;
-
-                    cmd.CommandText = "update inventoryfolders set version=version+1 where folderID = ?folderID";
-                    cmd.Parameters.AddWithValue("?folderID", folderID);
-
-                    try
-                    {
-                        cmd.ExecuteNonQuery();
-                    }
-                    catch (Exception)
-                    {
-                        return false;
-                    }
-                }
-
-                dbcon.Close();
-            }
-
-            return true;
+            return ExecuteNonQuery(cmd) > 0;
         }
     }
 }

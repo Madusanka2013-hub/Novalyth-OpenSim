@@ -1156,3 +1156,56 @@ Next:
 - audit mutation-side database handlers for repeated connection opens and
   version increments;
 - prioritize transaction/connection reuse only where semantics stay identical.
+
+## R2 Inventory Performance – MySQL Mutation Transaction Reuse
+
+Status: **DEV RUNTIME VALIDATED**
+
+Date: 2026-08-14
+
+Audit finding:
+
+- MySqlFramework instances created from a connection string open a database
+  connection for each data-layer call;
+- Inventory mutations commonly consist of multiple related data-layer calls;
+- examples before this change:
+  - Store item/folder: write + parent folder version increment on separate
+    connections;
+  - Move item/folder: pre-read + move update + old-parent version increment +
+    new-parent version increment across multiple connection cycles;
+  - Delete item: pre-read + delete + one or more folder-version increments;
+- the single-field item delete path also performed a redundant pre-read before
+  dispatching into the array overload, which performed the same read again.
+
+Implementation:
+
+- logical MySQL inventory mutations now execute on one connection and one short
+  transaction;
+- transactional temporary handlers use the existing MySqlTransaction-aware
+  generic data layer;
+- folder-version increments now route through `ExecuteNonQuery`, so they reuse
+  the active transaction instead of unconditionally opening another connection;
+- StoreItem, StoreFolder, MoveItem, MoveFolder and DeleteItems use transactional
+  entry points;
+- the duplicate single-item delete pre-read was removed;
+- query semantics and folder-version update semantics were preserved.
+
+Validation:
+
+- solution built successfully before runtime deployment;
+- only Inventory Core was restarted;
+- native read batching and central Core Admission remained active;
+- an isolated temporary folder was created through the real `/xinventory`
+  ADDFOLDER path;
+- the temporary folder was moved to a second parent and back through the real
+  MOVEFOLDER path;
+- the transactional MySQL runtime marker was observed;
+- temporary test data was deleted and original parent folder versions restored;
+- Asset Core, DEV Robust and DEV Region were not restarted;
+- LIVE `/nvme/opensim` remained untouched.
+
+Next:
+
+- introduce a bulk mutation capability for MoveItems/DeleteItems so multi-item
+  operations share one transaction instead of one transaction per item;
+- preserve AllowDelete/link-only behavior when batching deletes.
