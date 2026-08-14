@@ -38,6 +38,7 @@ namespace Novalyth.Region.Appearance
         private bool m_enabled;
         private bool m_registerCaps;
         private bool m_advertiseCentralBake;
+        private int m_centralBakeVersion = 1;
         private string m_serviceURI = string.Empty;
         private string m_serviceToken = string.Empty;
 
@@ -54,6 +55,8 @@ namespace Novalyth.Region.Appearance
             m_registerCaps = config.GetBoolean("RegisterCaps", true);
             m_advertiseCentralBake =
                 config.GetBoolean("AdvertiseCentralBake", false);
+            m_centralBakeVersion =
+                Math.Max(1, config.GetInt("CentralBakeVersion", 1));
             m_serviceURI =
                 config.GetString("ServiceURI", string.Empty).TrimEnd('/');
             m_serviceToken =
@@ -70,9 +73,9 @@ namespace Novalyth.Region.Appearance
 
             if (m_advertiseCentralBake)
             {
-                m_log.Warn(
-                    "[NOVALYTH SSA C1]: AdvertiseCentralBake=True configured, " +
-                    "but C1 intentionally does not advertise SSA until the pixel compositor exists");
+                m_log.WarnFormat(
+                    "[NOVALYTH SSA C3]: viewer advertisement armed; CentralBakeVersion={0}",
+                    m_centralBakeVersion);
             }
         }
 
@@ -80,13 +83,45 @@ namespace Novalyth.Region.Appearance
 
         public void RegionLoaded(Scene scene)
         {
-            if (m_enabled && m_registerCaps)
+            if (!m_enabled)
+                return;
+
+            if (m_registerCaps)
                 scene.EventManager.OnRegisterCaps += RegisterCaps;
+
+            if (!m_advertiseCentralBake)
+                return;
+
+            ISimulatorFeaturesModule simulatorFeatures =
+                scene.RequestModuleInterface<ISimulatorFeaturesModule>();
+
+            if (simulatorFeatures == null)
+            {
+                m_log.Error(
+                    "[NOVALYTH SSA C3]: SimulatorFeatures module unavailable; " +
+                    "CentralBakeVersion was NOT advertised");
+                return;
+            }
+
+            simulatorFeatures.AddFeature(
+                "CentralBakeVersion",
+                OSD.FromInteger(m_centralBakeVersion));
+
+            m_log.WarnFormat(
+                "[NOVALYTH SSA C3]: CentralBakeVersion={0} advertised through SimulatorFeatures",
+                m_centralBakeVersion);
         }
 
         public void RemoveRegion(Scene scene)
         {
             scene.EventManager.OnRegisterCaps -= RegisterCaps;
+
+            if (m_advertiseCentralBake)
+            {
+                ISimulatorFeaturesModule simulatorFeatures =
+                    scene.RequestModuleInterface<ISimulatorFeaturesModule>();
+                simulatorFeatures?.RemoveFeature("CentralBakeVersion");
+            }
         }
 
         public void PostInitialise() {}
@@ -121,9 +156,19 @@ namespace Novalyth.Region.Appearance
                     (request, response) =>
                         ProxyIncrementCofVersion(agentID, request, response)));
 
-            m_log.InfoFormat(
-                "[NOVALYTH SSA C1]: registered UpdateAvatarAppearance + IncrementCofVersion + legacy IncrementCOFVersion for {0}; CentralBakeVersion remains disabled",
-                agentID);
+            if (m_advertiseCentralBake)
+            {
+                m_log.InfoFormat(
+                    "[NOVALYTH SSA C3]: registered UpdateAvatarAppearance + IncrementCofVersion + legacy IncrementCOFVersion for {0}; CentralBakeVersion={1}",
+                    agentID,
+                    m_centralBakeVersion);
+            }
+            else
+            {
+                m_log.InfoFormat(
+                    "[NOVALYTH SSA C1]: registered UpdateAvatarAppearance + IncrementCofVersion + legacy IncrementCOFVersion for {0}; CentralBakeVersion remains disabled",
+                    agentID);
+            }
         }
 
         private void ProxyUpdateAvatarAppearance(

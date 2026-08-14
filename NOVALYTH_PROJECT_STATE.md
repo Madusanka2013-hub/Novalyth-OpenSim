@@ -1483,3 +1483,18 @@ Viewer validation:
 - No bake recipe, J2K compositor, Asset Core ID namespace, output dimensions,
   COF handling or viewer protocol surface changes.
 - CentralBakeVersion remains disabled.
+
+## Appearance Core C3 – Firestorm SSA advertisement source (20260814-150823)
+
+- Base commit: `c8e6301abfd4927f516bb74d558abb65f6d0712a`.
+- C2B2.1 remains the bake/compositor baseline.
+- C3 adds viewer-visible `CentralBakeVersion` through OpenSim's existing
+  `ISimulatorFeaturesModule` only when `[NovalythSSA] AdvertiseCentralBake=true`.
+- `CentralBakeVersion` is configurable and defaults to `1`.
+- Existing viewer CAPS remain:
+  - `UpdateAvatarAppearance`
+  - `IncrementCofVersion`
+  - legacy `IncrementCOFVersion`
+- With advertisement disabled, behavior remains the existing C2B2.1/C1 protocol surface.
+- This source-only step performs no DEV runtime deployment, no INI mutation and no restart.
+- LIVE `/nvme/opensim` is not touched.
