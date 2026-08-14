@@ -1280,3 +1280,18 @@ Viewer validation:
 - One informational marker per client confirms a real runtime bypass without per-texture log spam.
 - DEV Region only was restarted.
 - Asset Core, Inventory Core, DEV Robust and LIVE remained untouched.
+
+## Appearance Core Phase A – central bake persistence (20260814-083330)
+
+- Base commit: `8c0985d0c759e8e629b3519ff5ca9036907660ab`
+- Dedicated internal Appearance Core started on `http://127.0.0.1:8130`.
+- OpenSim's existing XBakes service is used as the first storage layer for central baked-texture persistence.
+- DEV Region uses `[XBakes] URL = http://127.0.0.1:8130`.
+- Bake storage directory: `/nvme/novalyth-opensim-dev/bakes`.
+- Raw port 8130 is internal and denied by UFW when UFW is active.
+- This phase deliberately does NOT advertise Second Life server-side baking yet.
+- `RegionProtocols` CentralBakeVersion bit remains unchanged until `UpdateAvatarAppearance` and `IncrementCOFVersion` exist.
+- Next architecture phase: SL-compatible appearance capabilities + persistent COF/appearance version state.
+- Final architecture phase after that: true server-side bake compositor and only then enable CentralBakeVersion.
+- DEV Region only was restarted.
+- DEV Robust, Asset Core, Inventory Core and LIVE remained untouched.
