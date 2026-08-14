@@ -4,10 +4,13 @@
  */
 
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Threading;
 using log4net;
 using Mono.Addins;
 using Nini.Config;
@@ -35,10 +38,39 @@ namespace Novalyth.Region.Appearance
             Timeout = TimeSpan.FromSeconds(5)
         };
 
+        // Bake work is intentionally separate from the short viewer-CAPS proxy
+        // timeout. UpdateAvatarAppearance must return promptly while the server
+        // bake is generated out-of-band, matching the SL SSA transaction model.
+        private static readonly HttpClient s_bakeHttp = new HttpClient(
+            new HttpClientHandler { UseProxy = false })
+        {
+            Timeout = TimeSpan.FromSeconds(120)
+        };
+
+        private static readonly IReadOnlyDictionary<string, uint>
+            s_bakeTextureIndices = new Dictionary<string, uint>(StringComparer.Ordinal)
+            {
+                ["head"] = 8,
+                ["upper"] = 9,
+                ["lower"] = 10,
+                ["eyes"] = 11,
+                ["skirt"] = 19,
+                ["hair"] = 20,
+                ["leftarm"] = 40,
+                ["leftleg"] = 41,
+                ["aux1"] = 42,
+                ["aux2"] = 43,
+                ["aux3"] = 44
+            };
+
+        private readonly ConcurrentDictionary<Scene, byte> m_scenes = new();
+        private readonly ConcurrentDictionary<UUID, BakeWorkState> m_bakeWork = new();
+
         private bool m_enabled;
         private bool m_registerCaps;
         private bool m_advertiseCentralBake;
         private int m_centralBakeVersion = 1;
+        private int m_bakeCoalesceMilliseconds = 75;
         private string m_serviceURI = string.Empty;
         private string m_serviceToken = string.Empty;
 
@@ -57,6 +89,8 @@ namespace Novalyth.Region.Appearance
                 config.GetBoolean("AdvertiseCentralBake", false);
             m_centralBakeVersion =
                 Math.Max(1, config.GetInt("CentralBakeVersion", 1));
+            m_bakeCoalesceMilliseconds =
+                Math.Clamp(config.GetInt("BakeCoalesceMilliseconds", 75), 0, 2000);
             m_serviceURI =
                 config.GetString("ServiceURI", string.Empty).TrimEnd('/');
             m_serviceToken =
@@ -74,12 +108,16 @@ namespace Novalyth.Region.Appearance
             if (m_advertiseCentralBake)
             {
                 m_log.WarnFormat(
-                    "[NOVALYTH SSA C3]: viewer advertisement armed; CentralBakeVersion={0}",
-                    m_centralBakeVersion);
+                    "[NOVALYTH SSA C4A]: viewer advertisement armed; CentralBakeVersion={0}; coalesce={1}ms; publish=last-known-good->atomic-server-bake",
+                    m_centralBakeVersion,
+                    m_bakeCoalesceMilliseconds);
             }
         }
 
-        public void AddRegion(Scene scene) {}
+        public void AddRegion(Scene scene)
+        {
+            m_scenes.TryAdd(scene, 0);
+        }
 
         public void RegionLoaded(Scene scene)
         {
@@ -108,13 +146,14 @@ namespace Novalyth.Region.Appearance
                 OSD.FromInteger(m_centralBakeVersion));
 
             m_log.WarnFormat(
-                "[NOVALYTH SSA C3]: CentralBakeVersion={0} advertised through SimulatorFeatures",
+                "[NOVALYTH SSA C4A]: CentralBakeVersion={0} advertised through SimulatorFeatures",
                 m_centralBakeVersion);
         }
 
         public void RemoveRegion(Scene scene)
         {
             scene.EventManager.OnRegisterCaps -= RegisterCaps;
+            m_scenes.TryRemove(scene, out _);
 
             if (m_advertiseCentralBake)
             {
@@ -159,7 +198,7 @@ namespace Novalyth.Region.Appearance
             if (m_advertiseCentralBake)
             {
                 m_log.InfoFormat(
-                    "[NOVALYTH SSA C3]: registered UpdateAvatarAppearance + IncrementCofVersion + legacy IncrementCOFVersion for {0}; CentralBakeVersion={1}",
+                    "[NOVALYTH SSA C4A]: registered UpdateAvatarAppearance + IncrementCofVersion + legacy IncrementCOFVersion for {0}; CentralBakeVersion={1}",
                     agentID,
                     m_centralBakeVersion);
             }
@@ -215,11 +254,18 @@ namespace Novalyth.Region.Appearance
                 response.ContentType = "application/llsd+xml";
                 response.RawBuffer = reply;
                 response.StatusCode = (int)coreResponse.StatusCode;
+
+                // SL semantics: UpdateAvatarAppearance requests a server-side
+                // appearance update. Do not destroy the currently visible baked
+                // appearance. Generate the new bake asynchronously and publish it
+                // only after all 11 bake assets are ready.
+                if (coreResponse.IsSuccessStatusCode && m_advertiseCentralBake)
+                    QueueServerBake(agentID, "UpdateAvatarAppearance");
             }
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH SSA C1]: UpdateAvatarAppearance proxy failed for {0}: {1}",
+                    "[NOVALYTH SSA C4A]: UpdateAvatarAppearance proxy failed for {0}: {1}",
                     agentID,
                     e.Message);
 
@@ -228,6 +274,299 @@ namespace Novalyth.Region.Appearance
                     HttpStatusCode.ServiceUnavailable,
                     "appearance_core_unavailable");
             }
+        }
+
+        private void QueueServerBake(UUID agentID, string reason)
+        {
+            BakeWorkState state =
+                m_bakeWork.GetOrAdd(agentID, _ => new BakeWorkState());
+
+            bool startWorker = false;
+            long generation;
+
+            lock (state.Sync)
+            {
+                generation = ++state.RequestedGeneration;
+                state.LastReason = reason ?? string.Empty;
+
+                if (!state.WorkerRunning)
+                {
+                    state.WorkerRunning = true;
+                    startWorker = true;
+                }
+            }
+
+            m_log.InfoFormat(
+                "[NOVALYTH SSA C4A]: bake requested agent={0} generation={1} reason={2}",
+                agentID,
+                generation,
+                reason);
+
+            if (startWorker)
+            {
+                ThreadPool.QueueUserWorkItem(
+                    _ => RunBakeWorker(agentID, state));
+            }
+        }
+
+        private void RunBakeWorker(UUID agentID, BakeWorkState state)
+        {
+            while (true)
+            {
+                if (m_bakeCoalesceMilliseconds > 0)
+                    Thread.Sleep(m_bakeCoalesceMilliseconds);
+
+                long targetGeneration;
+                string reason;
+
+                lock (state.Sync)
+                {
+                    targetGeneration = state.RequestedGeneration;
+                    reason = state.LastReason;
+                }
+
+                long started = Environment.TickCount64;
+
+                if (!TryRequestServerBake(
+                        agentID,
+                        out OSDMap manifest,
+                        out string bakeError))
+                {
+                    bool retry;
+                    lock (state.Sync)
+                    {
+                        retry = state.RequestedGeneration != targetGeneration;
+                        if (!retry)
+                            state.WorkerRunning = false;
+                    }
+
+                    m_log.ErrorFormat(
+                        "[NOVALYTH SSA C4A]: server bake failed agent={0} generation={1} reason={2} error={3}; last-known-good preserved",
+                        agentID,
+                        targetGeneration,
+                        reason,
+                        bakeError);
+
+                    if (retry)
+                        continue;
+
+                    return;
+                }
+
+                long latestGeneration;
+                lock (state.Sync)
+                    latestGeneration = state.RequestedGeneration;
+
+                if (latestGeneration != targetGeneration)
+                {
+                    m_log.InfoFormat(
+                        "[NOVALYTH SSA C4A]: stale bake suppressed agent={0} built_generation={1} latest_generation={2}; last-known-good remains visible",
+                        agentID,
+                        targetGeneration,
+                        latestGeneration);
+                    continue;
+                }
+
+                if (!TryPublishServerBake(
+                        agentID,
+                        manifest,
+                        out string publishError))
+                {
+                    bool retry;
+                    lock (state.Sync)
+                    {
+                        retry = state.RequestedGeneration != targetGeneration;
+                        if (!retry)
+                            state.WorkerRunning = false;
+                    }
+
+                    m_log.ErrorFormat(
+                        "[NOVALYTH SSA C4A]: server bake publish failed agent={0} generation={1} error={2}; last-known-good preserved",
+                        agentID,
+                        targetGeneration,
+                        publishError);
+
+                    if (retry)
+                        continue;
+
+                    return;
+                }
+
+                long elapsed = Environment.TickCount64 - started;
+                bool done;
+
+                lock (state.Sync)
+                {
+                    state.PublishedGeneration = targetGeneration;
+                    done = state.RequestedGeneration == targetGeneration;
+                    if (done)
+                        state.WorkerRunning = false;
+                }
+
+                m_log.InfoFormat(
+                    "[NOVALYTH SSA C4A]: atomic server appearance published agent={0} generation={1} cof={2} recipe={3} slots=11 elapsed_ms={4}",
+                    agentID,
+                    targetGeneration,
+                    manifest["cof_version"].AsInteger(),
+                    manifest["recipe_hash"].AsString(),
+                    elapsed);
+
+                if (done)
+                    return;
+            }
+        }
+
+        private bool TryRequestServerBake(
+            UUID agentID,
+            out OSDMap manifest,
+            out string error)
+        {
+            manifest = null;
+            error = string.Empty;
+
+            try
+            {
+                using HttpRequestMessage outgoing =
+                    new HttpRequestMessage(
+                        HttpMethod.Post,
+                        m_serviceURI + "/bake/" + agentID);
+
+                outgoing.Headers.TryAddWithoutValidation(
+                    "X-Novalyth-Service-Token",
+                    m_serviceToken);
+
+                using HttpResponseMessage coreResponse =
+                    s_bakeHttp.Send(outgoing);
+
+                byte[] reply = coreResponse.Content.ReadAsByteArrayAsync()
+                    .GetAwaiter().GetResult();
+
+                if (!coreResponse.IsSuccessStatusCode)
+                {
+                    error = "appearance_core_http_" +
+                        (int)coreResponse.StatusCode;
+                    return false;
+                }
+
+                using MemoryStream input = new MemoryStream(reply, false);
+                manifest = OSDParser.DeserializeLLSDXml(input) as OSDMap;
+
+                if (manifest == null)
+                {
+                    error = "appearance_core_invalid_llsd";
+                    return false;
+                }
+
+                if (!manifest.TryGetValue("success", out OSD success) ||
+                    !success.AsBoolean())
+                {
+                    error = manifest.TryGetValue("error", out OSD coreError)
+                        ? coreError.AsString()
+                        : "appearance_core_bake_failed";
+                    return false;
+                }
+
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e.GetType().Name + ":" + e.Message;
+                return false;
+            }
+        }
+
+        private bool TryPublishServerBake(
+            UUID agentID,
+            OSDMap manifest,
+            out string error)
+        {
+            error = string.Empty;
+
+            if (!manifest.TryGetValue("bakes", out OSD bakesOSD) ||
+                bakesOSD is not OSDArray bakes)
+            {
+                error = "manifest_bakes_missing";
+                return false;
+            }
+
+            Primitive.TextureEntry textureEntry =
+                new Primitive.TextureEntry(
+                    AppearanceManager.DEFAULT_AVATAR_TEXTURE);
+
+            int validBakes = 0;
+
+            foreach (OSD entry in bakes)
+            {
+                if (entry is not OSDMap bake)
+                    continue;
+
+                string name = bake["name"].AsString();
+                if (!s_bakeTextureIndices.TryGetValue(name, out uint textureIndex))
+                    continue;
+
+                if (bake["status"].AsString() != "j2k_stored" ||
+                    !UUID.TryParse(bake["asset_id"].AsString(), out UUID assetID) ||
+                    assetID.IsZero())
+                {
+                    error = "invalid_bake_slot:" + name;
+                    return false;
+                }
+
+                Primitive.TextureEntryFace face =
+                    textureEntry.GetFace(textureIndex);
+                face.TextureID = assetID;
+                validBakes++;
+            }
+
+            if (validBakes != s_bakeTextureIndices.Count)
+            {
+                error = "incomplete_bake_set:" + validBakes;
+                return false;
+            }
+
+            ScenePresence sp = FindRootPresence(agentID);
+            if (sp == null)
+            {
+                error = "root_presence_not_found";
+                return false;
+            }
+
+            IAvatarFactoryModule factory =
+                sp.Scene.RequestModuleInterface<IAvatarFactoryModule>();
+            if (factory == null)
+            {
+                error = "avatar_factory_unavailable";
+                return false;
+            }
+
+            // Transactional publish: SetAppearance receives the complete texture
+            // entry only after every server bake is stored. Until this exact point
+            // the previous Appearance.Texture stays untouched (last-known-good).
+            factory.SetAppearance(
+                sp,
+                textureEntry,
+                sp.Appearance.VisualParams,
+                null);
+
+            // OpenSim normally queues an appearance send. SSA should not add the
+            // legacy two-second send delay after the server bake is already ready.
+            // Send to the owning viewer as well as all observers immediately.
+            sp.SendAppearanceToAgentNF(sp);
+            sp.SendAppearanceToAllOtherAgents();
+
+            return true;
+        }
+
+        private ScenePresence FindRootPresence(UUID agentID)
+        {
+            foreach (Scene scene in m_scenes.Keys)
+            {
+                ScenePresence sp = scene.GetScenePresence(agentID);
+                if (sp != null && !sp.IsDeleted && !sp.IsChildAgent)
+                    return sp;
+            }
+
+            return null;
         }
 
         private void ProxyIncrementCofVersion(
@@ -276,6 +615,15 @@ namespace Novalyth.Region.Appearance
                     HttpStatusCode.ServiceUnavailable,
                     "appearance_core_unavailable");
             }
+        }
+
+        private sealed class BakeWorkState
+        {
+            public readonly object Sync = new object();
+            public long RequestedGeneration;
+            public long PublishedGeneration;
+            public bool WorkerRunning;
+            public string LastReason = string.Empty;
         }
 
         private static void WriteViewerError(

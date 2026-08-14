@@ -1498,3 +1498,28 @@ Viewer validation:
 - With advertisement disabled, behavior remains the existing C2B2.1/C1 protocol surface.
 - This source-only step performs no DEV runtime deployment, no INI mutation and no restart.
 - LIVE `/nvme/opensim` is not touched.
+
+## Appearance Core C4A – SL-style atomic server-bake publish bridge (20260814-154521)
+
+- Base commit: `ebbfa50f9a19f7913a10d6bfdfbf10c00aee8a99`.
+- C3 Firestorm advertisement remains enabled through `CentralBakeVersion=1`.
+- C4A closes the missing wire-to-runtime gap: `UpdateAvatarAppearance` now queues
+  an asynchronous server bake and publishes the completed 11 bake asset IDs into
+  the live region `AvatarAppearance` only after the complete bake set is ready.
+- Second-Life-style last-known-good behavior: the currently visible appearance is
+  retained while the next generation is baking; failed/incomplete/stale generations
+  are never published.
+- Rapid outfit changes are coalesced (default 75 ms) and generation-gated. If a newer
+  UpdateAvatarAppearance arrives while a bake is running, the stale completed bake is
+  suppressed and the worker proceeds to the newest generation.
+- The final server appearance is sent immediately to the owning viewer and all other
+  agents after atomic publication, bypassing OpenSim's legacy queued appearance-send
+  delay after the bake is already complete.
+- Modern 11-slot mapping is preserved: head=8, upper=9, lower=10, eyes=11, skirt=19,
+  hair=20, leftarm=40, leftleg=41, aux1=42, aux2=43, aux3=44.
+- `IncrementCofVersion` remains a COF synchronization capability; it does not itself
+  start a bake. `UpdateAvatarAppearance` is the bake trigger, matching SL semantics.
+- New optional region setting: `[NovalythSSA] BakeCoalesceMilliseconds` (default 75,
+  range 0..2000). No INI change is required for the default.
+- This step is source/build/commit only. No DEV runtime deployment, no restart, no
+  runtime INI mutation and no LIVE `/nvme/opensim` changes are performed.
