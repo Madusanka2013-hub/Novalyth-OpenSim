@@ -744,3 +744,48 @@ This does not change normal scheduling, worker counts, queue limits or Stage-3
 response wake behavior.
 
 No LIVE deployment is performed by this source patch.
+
+## R1 Asset Service Split – Phase A
+
+Status: **DEV RUNTIME CUTOVER READY**
+
+Date: 2026-08-14
+
+Architecture:
+
+- dedicated Asset Core process: `Robust.dll -inifile Robust.Asset.ini`;
+- Asset Core backend endpoint: `http://127.0.0.1:8110`;
+- service: `OpenSim.Services.AssetService.dll:AssetService`;
+- storage: existing `novalyth_robust_dev.assets`;
+- DEV region `AssetServerURI`: `http://127.0.0.1:8110`;
+- viewer traffic still enters through region CAPS;
+- Stage 3 response wake and Stage 4.1 fair dispatch remain unchanged;
+- existing DEV Robust keeps its own AssetServiceConnector in Phase A for
+  Login/HG/Map compatibility;
+- TCP 8110 is denied externally by UFW;
+- LIVE `/nvme/opensim` is unchanged.
+
+Validation:
+
+- Asset Core starts independently and loads `AssetServiceConnector`;
+- deterministic benchmark asset `01060176-57ff-4df0-8885-035c15895efa` was fetched directly from Asset Core;
+- HTTP status: 200;
+- returned bytes: 32443;
+- returned byte count exactly matched `novalyth_robust_dev.assets.data`;
+- the original installer smoke selected a raw largest DB row rather than a
+  known-good OpenSim asset and was rejected with HTTP 404; Phase-A validation
+  now uses deterministic assets already exercised by the Stage-3/4 benchmark.
+
+Screen helper correction:
+
+- GNU Screen mode changed from `-D -m` (no fork, caller blocks) to
+  `-d -m` (detached child, caller returns immediately).
+
+Next validation:
+
+1. start DEV Robust;
+2. start DEV Region;
+3. reset asset metrics;
+4. run deterministic C32 through region CAPS;
+5. confirm the region backend now reaches Asset Core on 8110 and compare
+   latency/throughput against the Stage-4.1 baseline.
