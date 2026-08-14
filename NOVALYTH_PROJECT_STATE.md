@@ -365,29 +365,101 @@ Measurement procedure after DEV deployment:
 
 ### R1 Stage 3 – Event-driven Asset CAPS Response Wake
 
-Implemented in source, pending DEV deployment/test:
+Status: **DEV-VALIDIERT / ERFOLGREICH**
+
+Source commit:
+
+`76c3b568873edfa63fb9648e1587d1d7e316395b`
+
+Implemented:
 
 - Added opt-in `PollServiceEventArgs.UseResponseReadyNotification`.
 - Added an event-driven request state machine to prevent duplicate scheduling during response-ready/worker races.
 - Added immediate `ResponseReady` wake-up support in `PollServiceRequestManager`.
 - Existing non-opt-in poll services retain the legacy 100 ms retry cadence unchanged.
-- The 100 ms watcher remains as timeout/disconnect/lost-notification fallback for opt-in requests.
+- The 100 ms watcher remains only as timeout/disconnect/lost-notification fallback for opt-in requests.
 - `GetAssetsModule` opts asset CAPS into the wake-up path only when `[ClientStack.LindenCaps] Cap_AssetResponseWake = true`.
-- `Cap_AssetResponseWake` defaults to `false` for upstream-compatible behavior until explicitly enabled.
-- CAPS asset worker count remains 3; the 8-worker benchmark was worse and is rejected for now.
-- No LIVE runtime change is part of this source commit.
+- `Cap_AssetResponseWake` defaults to `false` in source for upstream-compatible behavior.
+- DEV is explicitly configured with `Cap_AssetResponseWake = true`.
+- CAPS asset worker count remains `3`.
+- LIVE `/nvme/opensim` was not modified.
 
-Measured pre-Stage-3 baseline using 500 distinct textures + 500 distinct meshes, benchmark concurrency 32:
+DEV startup validation:
 
-- 3 CAPS workers: 1000 requests in 3.224 s, 310.15 req/s, client p50 100.20 ms, p95 111.13 ms, p99 200.68 ms.
-- 8 CAPS workers: 1000 requests in 5.629 s, 177.66 req/s, client p50 99.90 ms, p95 109.95 ms, p99 2529.30 ms.
-- Backend/region-local latency remained far below client p50, pointing at PollService response polling rather than the asset backend.
+- `[GETASSETS]: CAPS asset workers=3, fetch timeout=15000 ms`
+- `[GETASSETS]: asset response wake=enabled`
+
+Fixed benchmark workload:
+
+- 500 distinct textures
+- 500 distinct meshes
+- 1000 requests total
+- client concurrency 32
+- identical asset list before/after Stage 3
+
+Stage-2 baseline, 3 workers, legacy PollService response polling:
+
+- total: 3.224 s
+- throughput: 310.15 req/s
+- client p50: 100.20 ms
+- client p95: 111.13 ms
+- client p99: 200.68 ms
+- client max: 217.20 ms
+
+Stage-3 result, 3 workers, event-driven response wake:
+
+- total: 0.506 s
+- throughput: 1977.64 req/s
+- client p50: 12.12 ms
+- client p95: 49.98 ms
+- client p99: 77.95 ms
+- client max: 88.84 ms
+- 997 HTTP 200, 3 HTTP 404
+- 0 exceptions
+
+Stage-3 server metrics:
+
+- caps requests: 1000
+- caps peak pending: 29
+- caps peak inflight: 3
+- backend started/completed: 1000/1000
+- backend timeouts/errors/notfound: 0/0/0
+- backend p50/p95/p99: <=5 / <=5 / <=5 ms
+- region-local peak pending: 3
+- region-local peak inflight: 2
+- region-local completed: 999
+- region-local errors/notfound: 0/0
+- region-local p50/p95/p99: <=5 / <=5 / <=5 ms
+- remote/HG path unused in this benchmark
+
+Measured improvement versus the Stage-2 3-worker baseline:
+
+- total wall time reduced by ~84.3%
+- throughput improved by ~6.38x
+- client p50 reduced by ~87.9%
+- client p95 reduced by ~55.0%
+- client p99 reduced by ~61.2%
+- client max reduced by ~59.1%
+
+Conclusion:
+
+The legacy PollService response-retry cadence was a real Asset CAPS latency floor.
+The Stage-3 event-driven wake path removes that floor without changing the global
+PollService behavior and without introducing observed request errors or timeouts.
+Raising CAPS workers from 3 to 8 is still rejected based on the previous A/B result.
 
 CURRENT NEXT ACTION:
 
-1. Deploy the exact Stage-3 commit only to `/nvme/novalyth-opensim-dev`.
-2. Keep `Cap_AssetWorkers = 3`.
-3. Enable DEV-only `Cap_AssetResponseWake = true`.
-4. Run the same fixed 1000-asset benchmark with concurrency 32.
-5. Compare client p50/p95/p99 and `show asset pipeline` against the Stage-2 3-worker baseline.
-6. If client p50 drops materially below the legacy ~100 ms floor without errors/timeouts, retain the event-driven path and proceed to controlled backpressure/fairness work.
+R1 Stage 4 – Asset queue safety and fairness.
+
+Goals:
+
+1. Keep `Cap_AssetWorkers = 3` and `Cap_AssetResponseWake = true` in DEV.
+2. Do not globally modify PollService retry timing.
+3. Add bounded capacity/backpressure to the Asset CAPS work queue instead of allowing unbounded accumulation.
+4. Add queue-full/rejected/backpressure metrics.
+5. Preserve timeout/error response guarantees.
+6. Design request fairness so one viewer/user cannot monopolize the entire Asset CAPS queue.
+7. Benchmark Stage 4 using the same fixed 1000-asset workload plus a higher-concurrency stress test.
+8. Only after measurements decide whether RegionAsset local workers need separate tuning.
+9. LIVE remains untouched until DEV validation is complete.
