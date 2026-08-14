@@ -120,3 +120,12 @@ doc/doxygen.error.log
 bin/OpenSim.ini
 
 *.patch
+
+# Novalyth Linux generated build outputs
+/compile.sh
+/bin/OpenSim
+/bin/OpenSim.ConsoleClient
+/bin/OpenSim.Tools.Configger
+/bin/Robust
+/bin/pCampBot
+/bin/*.runtimeconfig.json

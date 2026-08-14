@@ -1,0 +1,38 @@
+name: Novalyth OpenSim Build
+
+on:
+  push:
+    branches:
+      - novalyth-main
+  pull_request:
+    branches:
+      - novalyth-main
+
+permissions:
+  contents: read
+
+jobs:
+  release-build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdiplus libc6-dev
+
+      - name: Prebuild
+        run: |
+          chmod +x ./runprebuild.sh
+          ./runprebuild.sh
+
+      - name: Release build
+        run: dotnet build --configuration Release OpenSim.sln
