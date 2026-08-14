@@ -466,7 +466,7 @@ Goals:
 
 ### R1 Stage 4 – Asset Queue Safety + Per-Agent Fairness
 
-Status: **SOURCE IMPLEMENTATION – DEV TEST PENDING**
+Status: **DEV VALIDATED**
 
 Design decision:
 
@@ -578,3 +578,128 @@ Validation plan:
 5. Run a separate c512 emergency-cap test only to prove the global hard bound.
 6. Perform a multi-agent fairness test before calling Stage 4 production-ready.
 7. LIVE remains untouched.
+
+## R1 Stage 4.1 DEV Validation — 2026-08-14
+
+Status: **DEV VALIDATED**
+
+Validated source commit:
+`1ac837b3a9ba5814aa02beab7a5e9dd45d85027b`
+
+DEV configuration used:
+
+```ini
+Cap_AssetWorkers = 3
+Cap_AssetFetchTimeoutMs = 15000
+Cap_AssetResponseWake = true
+Cap_AssetMaxOutstanding = 256
+Cap_AssetMaxOutstandingPerAgent = 0
+```
+
+### C32 normal-load benchmark
+
+- Requests: 1000
+- HTTP 200/206: 997
+- HTTP 404: 3
+- HTTP 503: 0
+- Exceptions: 0
+- Total: 0.371 s
+- Throughput: 2693.45 req/s
+- Client p50: 4.37 ms
+- Client p95: 14.75 ms
+- Client p99: 21.39 ms
+- Client max: 57.35 ms
+- Guard: accepted=1000, released=1000, reject_global=0, reject_agent=0, enqueue_fail=0
+- Fair dispatch: peak_queued=17, peak_inflight=3, dispatched=1000, worker_enqueue_fail=0
+- Final gauges: outstanding=0, queued=0, inflight=0
+
+Verdict: normal-load path is transparent and faster than the previous Stage 3 reference run.
+
+### C256 bounded-queue benchmark
+
+- Requests: 1000
+- HTTP 200/206: 997
+- HTTP 404: 3
+- HTTP 503: 0
+- Exceptions: 0
+- Total: 1.147 s
+- Throughput: 871.75 req/s
+- Client p50: 105.84 ms
+- Client p95: 828.36 ms
+- Client p99: 882.59 ms
+- Client max: 954.66 ms
+- Guard: peak_outstanding=256, accepted=1000, released=1000, reject_global=0, reject_agent=0, enqueue_fail=0
+- Fair dispatch: peak_queued=253, peak_inflight=3, dispatched=1000, worker_enqueue_fail=0
+- Final gauges: outstanding=0, queued=0, inflight=0
+- Backend and region-local p50/p95/p99 remained <=5 ms; the long tail is controlled queue wait.
+
+Verdict: a single agent may queue up to the global bound without routine per-agent 503 rejection, while only three jobs are admitted to the legacy ObjectJobEngine at once.
+
+### C512 emergency-global-cap benchmark
+
+- Requests: 1000
+- HTTP 200/206: 356
+- HTTP 404: 1
+- HTTP 503: 643
+- Exceptions: 0
+- Total: 1.282 s
+- Throughput: 780.05 req/s
+- Client p50: 77.31 ms
+- Client p95: 1030.81 ms
+- Client p99: 1050.49 ms
+- Client max: 1074.27 ms
+- Guard: peak_outstanding=256, accepted=357, released=357, reject_global=643, reject_agent=0, enqueue_fail=0
+- Fair dispatch: peak_queued=253, peak_inflight=3, dispatched=357, worker_enqueue_fail=0
+- Final gauges: outstanding=0, queued=0, inflight=0
+
+Verdict: the global emergency cap is effective and prevents unbounded asset backlog growth. HTTP 503 is reserved for this emergency-overload path, not routine per-agent fairness.
+
+### Two-agent fairness benchmark
+
+Two distinct logged-in CAPS agents were loaded concurrently with 500 requests each and client concurrency 64 per agent.
+
+Agent 1:
+- HTTP 200/206: 499
+- HTTP 404: 1
+- Exceptions: 0
+- p50: 53.88 ms
+- p95: 524.51 ms
+- p99: 546.93 ms
+- max: 626.92 ms
+
+Agent 2:
+- HTTP 200/206: 498
+- HTTP 404: 2
+- Exceptions: 0
+- p50: 55.31 ms
+- p95: 482.77 ms
+- p99: 517.52 ms
+- max: 535.67 ms
+
+Combined:
+- Total time: 0.919 s
+- HTTP 503: 0
+- Exceptions: 0
+- P95 fairness ratio (max/min): **1.086x**
+
+Verdict: external two-agent behavior is balanced and work-conserving; neither client showed starvation or routine overload rejection.
+
+Note: the post-run `show asset queue` server-side `peak_agents=2` counter was not captured before the DEV process was shut down. The two distinct agent UUIDs/CAPS endpoints and their concurrent benchmark results were captured, so the functional multi-agent fairness result is retained without restarting DEV solely to recover an ephemeral diagnostic counter.
+
+### Stage 4.1 overall verdict
+
+**DEV VALIDATED.**
+
+Stage 4.1 now provides:
+
+1. event-driven CAPS completion from Stage 3;
+2. a hard global outstanding-request safety bound;
+3. no routine hard per-agent rejection;
+4. work-conserving per-agent round-robin dispatch;
+5. at most `Cap_AssetWorkers` jobs admitted into the legacy asset ObjectJobEngine;
+6. zero leaked queue/guard slots in C32, C256 and C512 validation runs;
+7. balanced external behavior under simultaneous two-agent load.
+
+Before any LIVE rollout, perform the remaining shutdown/reload release-path audit so a region close/reload cannot leave static fair-dispatch/guard accounting stale inside a still-running process.
+
+Next R1 architectural step after that safety audit: split the Asset Service / Asset Edge into its own coarse-grained service boundary.
