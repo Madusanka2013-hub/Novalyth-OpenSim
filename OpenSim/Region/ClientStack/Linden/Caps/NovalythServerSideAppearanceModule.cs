@@ -656,6 +656,41 @@ namespace Novalyth.Region.Appearance
                 return false;
             }
 
+            int publishedAppearanceVersion =
+                manifest.TryGetValue("appearance_version", out OSD appearanceVersionOSD)
+                    ? appearanceVersionOSD.AsInteger()
+                    : 0;
+
+            int publishedCofVersion =
+                manifest.TryGetValue("cof_version", out OSD cofVersionOSD)
+                    ? cofVersionOSD.AsInteger()
+                    : -1;
+
+            if (publishedAppearanceVersion <= 0 ||
+                publishedAppearanceVersion > byte.MaxValue ||
+                publishedCofVersion < 0)
+            {
+                error =
+                    "invalid_ssa_publish_stamp:" +
+                    publishedAppearanceVersion + ":" +
+                    publishedCofVersion;
+                return false;
+            }
+
+            // NOVALYTH SSA C4D3
+            // Arm the protocol stamp only after textures, wearables, params and
+            // size belong to this exact authoritative COF snapshot.
+            sp.SetNovalythServerAppearanceStamp(
+                (byte)publishedAppearanceVersion,
+                publishedCofVersion);
+
+            m_log.InfoFormat(
+                "[NOVALYTH SSA C4D3]: authoritative SSA stamp armed agent={0} generation={1} appearance_version={2} cof={3}",
+                agentID,
+                targetGeneration,
+                publishedAppearanceVersion,
+                publishedCofVersion);
+
             m_log.InfoFormat(
                 "[NOVALYTH SSA C4D2]: canonical full-body state applied agent={0} generation={1} visual_params={2} wearables={3} size_z={4:F3}",
                 agentID,

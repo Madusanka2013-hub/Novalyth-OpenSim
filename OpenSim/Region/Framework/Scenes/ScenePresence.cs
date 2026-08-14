@@ -138,6 +138,57 @@ namespace OpenSim.Region.Framework.Scenes
         // after the first viewer SetAppearance update.
         private int m_novalythLoginBakeRecoveryPending = 0;
 
+        // NOVALYTH APPEARANCE C4D3
+        // Packed atomically so AgentAppearance can never pair a new COF with an
+        // old appearance version (or vice versa). High 32 bits: appearance
+        // version, low 32 bits: signed COF version.
+        private long m_novalythServerAppearanceStamp = 0;
+
+        public void SetNovalythServerAppearanceStamp(
+            byte appearanceVersion,
+            int cofVersion)
+        {
+            if (appearanceVersion == 0 || cofVersion < 0)
+            {
+                Interlocked.Exchange(
+                    ref m_novalythServerAppearanceStamp,
+                    0);
+                return;
+            }
+
+            long packed =
+                ((long)appearanceVersion << 32) |
+                (long)(uint)cofVersion;
+
+            Interlocked.Exchange(
+                ref m_novalythServerAppearanceStamp,
+                packed);
+        }
+
+        public bool TryGetNovalythServerAppearanceStamp(
+            out byte appearanceVersion,
+            out int cofVersion)
+        {
+            long packed =
+                Interlocked.Read(
+                    ref m_novalythServerAppearanceStamp);
+
+            if (packed == 0)
+            {
+                appearanceVersion = 0;
+                cofVersion = -1;
+                return false;
+            }
+
+            appearanceVersion =
+                (byte)((ulong)packed >> 32);
+            cofVersion =
+                unchecked((int)(uint)packed);
+
+            return appearanceVersion > 0 &&
+                   cofVersion >= 0;
+        }
+
         public void MarkNovalythLoginBakeRecoveryPending()
         {
             Interlocked.Exchange(ref m_novalythLoginBakeRecoveryPending, 1);

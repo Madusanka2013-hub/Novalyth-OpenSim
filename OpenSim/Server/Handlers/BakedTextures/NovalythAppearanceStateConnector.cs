@@ -120,6 +120,12 @@ namespace Novalyth.Server.Appearance
         private const int WT_PHYSICS = 15;
         private const int WT_UNIVERSAL = 16;
 
+        // NOVALYTH APPEARANCE C4D3
+        // Project Sunshine/SSA AgentAppearance version. Firestorm also knows
+        // this value as visual parameter 11000 (AppearanceMessage_Version).
+        private const int ServerAppearanceVersion = 1;
+        private const int AppearanceMessageVersionParamID = 11000;
+
         // NOVALYTH APPEARANCE C4D2
         // SL bodyparts are singleton authorities. Multiple clothing/tattoo/
         // alpha/universal layers are valid, but Shape/Skin/Hair/Eyes must each
@@ -3031,6 +3037,11 @@ namespace Novalyth.Server.Appearance
                         ? found
                         : vp.DefaultValue;
 
+                // C4D3: if param 11000 belongs to the transmitted visual-param
+                // generation, it must agree with AppearanceData.AppearanceVersion.
+                if (vp.ParamID == AppearanceMessageVersionParamID)
+                    value = ServerAppearanceVersion;
+
                 if (vp.Group == 0)
                 {
                     if (wireIndex >= requiredCount)
@@ -3392,6 +3403,7 @@ namespace Novalyth.Server.Appearance
             manifest["appearance_payload_ready"] = appearancePayloadReady;
             manifest["appearance_payload_error"] =
                 appearancePayloadError ?? string.Empty;
+            manifest["appearance_version"] = ServerAppearanceVersion;
             manifest["visual_params_b64"] =
                 appearancePayloadReady
                     ? Convert.ToBase64String(canonicalVisualParams)

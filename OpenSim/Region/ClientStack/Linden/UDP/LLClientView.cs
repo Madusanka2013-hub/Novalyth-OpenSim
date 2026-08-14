@@ -4428,6 +4428,29 @@ namespace OpenSim.Region.ClientStack.LindenUDP
 
         public void SendAppearance(UUID targetID, byte[] visualParams, byte[] textureEntry, float hover)
         {
+            // NOVALYTH SSA C4D3
+            // RegionHandshakeReply bit 2/value 4 says the receiving viewer
+            // supports self/server appearance. Pair server bake UUIDs with their
+            // exact AppearanceVersion + authoritative COF in the standard
+            // AvatarAppearance.AppearanceData variable block.
+            bool sendServerAppearanceData = false;
+            byte serverAppearanceVersion = 0;
+            int serverCofVersion = -1;
+
+            if ((m_viewerHandShakeFlags & 4U) != 0)
+            {
+                ScenePresence targetPresence =
+                    m_scene.GetScenePresence(targetID);
+
+                if (targetPresence is not null)
+                {
+                    sendServerAppearanceData =
+                        targetPresence.TryGetNovalythServerAppearanceStamp(
+                            out serverAppearanceVersion,
+                            out serverCofVersion);
+                }
+            }
+
             // doing post zero encode, because odds of beeing bad are not that low
             UDPPacketBuffer buf = OpenSimUDPBase.GetNewUDPBuffer(m_udpClient.RemoteEndPoint);
             Buffer.BlockCopy(AvatarAppearanceHeader, 0, buf.Data, 0, 10);
@@ -4458,8 +4481,42 @@ namespace OpenSim.Region.ClientStack.LindenUDP
             if(len > 0)
                 Buffer.BlockCopy(visualParams, 0, data, pos, len); pos += len;
 
-            // no AppearanceData
-            data[pos++] = 0;
+            if (sendServerAppearanceData)
+            {
+                // AppearanceData Variable block count
+                data[pos++] = 1;
+
+                // AppearanceVersion U8
+                data[pos++] = serverAppearanceVersion;
+
+                // CofVersion S32
+                Utils.IntToBytesSafepos(
+                    serverCofVersion,
+                    data,
+                    pos);
+                pos += 4;
+
+                // Flags U32 - reserved/future use, zero for current SSA.
+                Utils.UIntToBytesSafepos(
+                    0U,
+                    data,
+                    pos);
+                pos += 4;
+
+                m_log.InfoFormat(
+                    "[NOVALYTH SSA C4D3]: AgentAppearance SSA receiver={0} target={1} self={2} appearance_version={3} cof={4}",
+                    m_agentId,
+                    targetID,
+                    m_agentId == targetID,
+                    serverAppearanceVersion,
+                    serverCofVersion);
+            }
+            else
+            {
+                // Legacy/non-SSA receiver or target without a completed server bake.
+                data[pos++] = 0;
+            }
+
             // AppearanceHover vector 3
             data[pos++] = 1;
             //Utils.FloatToBytesSafepos(0, data, pos); pos += 4;

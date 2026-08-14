@@ -1647,3 +1647,39 @@ C4D2:
 
 Source/build/commit only. No runtime deployment, service restart, region restart,
 INI mutation or LIVE `/nvme/opensim` change is performed by this step.
+
+## Appearance C4D3 – authoritative SSA AgentAppearance
+
+Observed after C4D2:
+- Full canonical server appearance was generated/published, but the owning
+  Firestorm could render a broken/blue body while entering Edit Shape showed the
+  locally correct skin/tattoo/body.
+- Firestorm's SSA state is driven by AvatarAppearance appearance version:
+  `setIsUsingServerBakes(appearance_version > 0)`.
+- Current LLClientView.SendAppearance emitted zero `AppearanceData` blocks even
+  after RegionHandshake negotiated SSA.
+- AvatarFactory still accepted legacy viewer `AgentSetAppearance` texture entries
+  and `AvatarNowWearing`, allowing client/legacy state to overwrite or race the
+  authoritative server-bake state after C4D2 publication.
+
+C4D3:
+- Appearance Core manifest carries `appearance_version=1`.
+- Visual parameter ID 11000 is forced to version 1 if present in the transmitted
+  visual-param generation, preventing contradiction with AppearanceData.
+- ScenePresence atomically stores the exact published SSA
+  `(AppearanceVersion, CofVersion)` stamp.
+- The C4D2 publish bridge arms that stamp only after canonical wearables,
+  VisualParams, size and all 11 bake UUIDs have been applied.
+- LLClientView emits standard AvatarAppearance.AppearanceData for SSA-capable
+  receivers: AppearanceVersion U8, authoritative CofVersion S32, Flags=0.
+- Non-SSA receivers and targets without a completed server bake continue to get
+  the legacy zero-block form.
+- AvatarFactory ignores viewer-side AgentSetAppearance and AvatarNowWearing
+  mutation only when BOTH:
+    1) viewer RegionHandshakeReply bit 4 is present, and
+    2) this region advertises CentralBakeVersion > 0.
+  This preserves legacy behavior for non-SSA regions/viewers.
+- UpdateAvatarAppearance + authoritative COF remains the mutation path.
+
+Source/build/commit only. No runtime deployment, restart, INI mutation or LIVE
+`/nvme/opensim` change in this step.

@@ -35,6 +35,7 @@ using System.Timers;
 using log4net;
 using Nini.Config;
 using OpenMetaverse;
+using OpenMetaverse.StructuredData;
 using OpenSim.Framework;
 using OpenSim.Framework.Monitoring;
 using OpenSim.Region.Framework.Interfaces;
@@ -1193,6 +1194,29 @@ namespace OpenSim.Region.CoreModules.Avatar.AvatarFactory
         }
 
         /// <summary>
+        // NOVALYTH SSA C4D3
+        private bool IsAuthoritativeServerAppearanceClient(IClientAPI client)
+        {
+            if (client == null ||
+                (client.GetViewerCaps() & 4U) == 0)
+            {
+                return false;
+            }
+
+            ISimulatorFeaturesModule simulatorFeatures =
+                m_scene.RequestModuleInterface<ISimulatorFeaturesModule>();
+
+            if (simulatorFeatures == null ||
+                !simulatorFeatures.TryGetFeature(
+                    "CentralBakeVersion",
+                    out OSD centralBakeVersion))
+            {
+                return false;
+            }
+
+            return centralBakeVersion.AsInteger() > 0;
+        }
+
         /// Set appearance data (texture asset IDs and slider settings) received from a client
         /// </summary>
         /// <param name="client"></param>
@@ -1204,6 +1228,21 @@ namespace OpenSim.Region.CoreModules.Avatar.AvatarFactory
             ScenePresence sp = m_scene.GetScenePresence(client.AgentId);
             if (sp != null)
             {
+                if (IsAuthoritativeServerAppearanceClient(client))
+                {
+                    // In SSA the COF/Appearance Core is authoritative. A viewer
+                    // AgentSetAppearance may still be emitted for local editing/
+                    // legacy compatibility, but its client-side bake UUIDs must
+                    // never overwrite the canonical server bake set.
+                    m_log.InfoFormat(
+                        "[NOVALYTH SSA C4D3]: ignored legacy AgentSetAppearance mutation agent={0} textures={1} visual_params={2} cache_items={3}",
+                        client.AgentId,
+                        textureEntry != null,
+                        visualParams?.Length ?? 0,
+                        cacheItems?.Length ?? 0);
+                    return;
+                }
+
                 SetAppearance(sp, textureEntry, visualParams, avSize, cacheItems);
 
                 // NOVALYTH APPEARANCE R2:
@@ -1255,6 +1294,14 @@ namespace OpenSim.Region.CoreModules.Avatar.AvatarFactory
             if (sp == null)
             {
                 m_log.WarnFormat("[AVFACTORY]: Client_OnAvatarNowWearing unable to find presence for {0}", client.AgentId);
+                return;
+            }
+
+            if (IsAuthoritativeServerAppearanceClient(client))
+            {
+                m_log.InfoFormat(
+                    "[NOVALYTH SSA C4D3]: ignored legacy AvatarNowWearing mutation agent={0}; authoritative COF remains source of truth",
+                    client.AgentId);
                 return;
             }
 
