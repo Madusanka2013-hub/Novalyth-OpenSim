@@ -70,6 +70,8 @@ namespace OpenSim.Region.ClientStack.Linden
             public UUID reqID;
             public OSHttpRequest request;
             public long enqueuedAtMs;
+            public UUID queueAgentID;
+            public bool queueGuardTracked;
         }
 
         public class APollResponse
@@ -86,7 +88,65 @@ namespace OpenSim.Region.ClientStack.Linden
         private static object m_loadLock = new object();
         private static int m_commandsRegistered = 0;
         private static bool m_assetResponseWake = false;
+        private static int m_assetMaxOutstanding = 0;
+        private static int m_assetMaxOutstandingPerAgent = 0;
+        private static int m_queueCommandsRegistered = 0;
         protected IUserManagement m_UserManagement = null;
+
+        private static void RegisterAssetQueueCommands()
+        {
+            if (System.Threading.Interlocked.CompareExchange(
+                    ref m_queueCommandsRegistered, 1, 0) != 0)
+                return;
+
+            MainConsole.Instance.Commands.AddCommand(
+                "Assets", false,
+                "show asset queue",
+                "show asset queue",
+                "Show Novalyth Asset CAPS queue guard/backpressure metrics",
+                string.Empty,
+                HandleShowAssetQueue);
+
+            MainConsole.Instance.Commands.AddCommand(
+                "Assets", false,
+                "reset asset queue",
+                "reset asset queue",
+                "Reset Novalyth Asset CAPS queue guard/backpressure metrics",
+                string.Empty,
+                HandleResetAssetQueue);
+        }
+
+        private static void HandleShowAssetQueue(string module, string[] cmd)
+        {
+            MainConsole.Instance.Output(NovalythAssetQueueGuard.FormatReport());
+        }
+
+        private static void HandleResetAssetQueue(string module, string[] cmd)
+        {
+            NovalythAssetQueueGuard.ResetMetrics();
+            MainConsole.Instance.Output("[NOVALYTH] Asset queue guard metrics reset.");
+        }
+
+        private static OSHttpResponse BuildAssetBackpressureResponse(
+            OSHttpRequest request, string reason)
+        {
+            OSHttpResponse response = new(request)
+            {
+                StatusCode = (int)System.Net.HttpStatusCode.ServiceUnavailable,
+                ContentType = "text/plain",
+                ContentLength64 = 0,
+                RawBuffer = Array.Empty<byte>(),
+                RawBufferLen = 0,
+                KeepAlive = true
+            };
+
+            response.AddHeader("Retry-After", "1");
+            response.AddHeader(
+                "X-Novalyth-Asset-Backpressure",
+                string.IsNullOrEmpty(reason) ? "capacity" : reason);
+
+            return response;
+        }
 
         #region Region Module interfaceBase Members
 
@@ -105,6 +165,21 @@ namespace OpenSim.Region.ClientStack.Linden
             m_assetFetchTimeoutMs = Math.Clamp(
                 config.GetInt("Cap_AssetFetchTimeoutMs", 15000), 1000, 120000);
             m_assetResponseWake = config.GetBoolean("Cap_AssetResponseWake", false);
+            m_assetMaxOutstanding = Math.Clamp(
+                config.GetInt("Cap_AssetMaxOutstanding", 0), 0, 8192);
+            m_assetMaxOutstandingPerAgent = Math.Clamp(
+                config.GetInt("Cap_AssetMaxOutstandingPerAgent", 0), 0, 2048);
+
+            if (m_assetMaxOutstanding > 0
+                && m_assetMaxOutstandingPerAgent > m_assetMaxOutstanding)
+            {
+                m_assetMaxOutstandingPerAgent = m_assetMaxOutstanding;
+            }
+
+            NovalythAssetQueueGuard.Configure(
+                m_assetMaxOutstanding,
+                m_assetMaxOutstandingPerAgent);
+            RegisterAssetQueueCommands();
 
             m_GetTextureURL = config.GetString("Cap_GetTexture", string.Empty);
             if (m_GetTextureURL != string.Empty)
@@ -180,6 +255,10 @@ namespace OpenSim.Region.ClientStack.Linden
                     m_log.InfoFormat(
                         "[GETASSETS]: asset response wake={0}",
                         m_assetResponseWake ? "enabled" : "disabled");
+                    m_log.InfoFormat(
+                        "[GETASSETS]: asset queue guard max_outstanding={0}, per_agent={1}",
+                        m_assetMaxOutstanding,
+                        m_assetMaxOutstandingPerAgent);
                 }
 
                 if (Interlocked.CompareExchange(ref m_commandsRegistered, 1, 0) == 0)
@@ -220,7 +299,18 @@ namespace OpenSim.Region.ClientStack.Linden
             {
                 NovalythAssetPipelineMetrics.CapsDequeued(
                     Environment.TickCount64 - poolreq.enqueuedAtMs);
-                poolreq.thepoll.Process(poolreq);
+                try
+                {
+                    poolreq.thepoll.Process(poolreq);
+                }
+                finally
+                {
+                    if (poolreq.queueGuardTracked)
+                    {
+                        NovalythAssetQueueGuard.Release(poolreq.queueAgentID);
+                        poolreq.queueGuardTracked = false;
+                    }
+                }
             }
         }
 
@@ -296,11 +386,36 @@ namespace OpenSim.Region.ClientStack.Linden
                         thepoll = this,
                         reqID = requestID,
                         request = request,
+                        queueAgentID = Id,
                         enqueuedAtMs = Environment.TickCount64
                     };
 
+                    if (!NovalythAssetQueueGuard.TryAcquire(
+                            reqinfo.queueAgentID,
+                            out bool queueTracked,
+                            out string rejectReason))
+                    {
+                        return BuildAssetBackpressureResponse(request, rejectReason);
+                    }
+
+                    reqinfo.queueGuardTracked = queueTracked;
+
                     NovalythAssetPipelineMetrics.CapsEnqueued();
-                    m_workerpool.Enqueue(reqinfo);
+
+                    if (!m_workerpool.Enqueue(reqinfo))
+                    {
+                        if (reqinfo.queueGuardTracked)
+                        {
+                            NovalythAssetQueueGuard.Release(
+                                reqinfo.queueAgentID,
+                                enqueueFailure: true);
+                            reqinfo.queueGuardTracked = false;
+                        }
+
+                        return BuildAssetBackpressureResponse(
+                            request, "worker-unavailable");
+                    }
+
                     return null;
                 };
 

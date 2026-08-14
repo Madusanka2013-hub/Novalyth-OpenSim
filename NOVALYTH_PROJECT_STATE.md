@@ -463,3 +463,67 @@ Goals:
 7. Benchmark Stage 4 using the same fixed 1000-asset workload plus a higher-concurrency stress test.
 8. Only after measurements decide whether RegionAsset local workers need separate tuning.
 9. LIVE remains untouched until DEV validation is complete.
+
+### R1 Stage 4 – Asset Queue Safety + Per-Agent Fairness
+
+Status: **SOURCE IMPLEMENTATION – DEV TEST PENDING**
+
+Design decision:
+
+Stage 4 does not modify `ObjectJobEngine` globally. Asset CAPS receives a
+Novalyth-specific admission guard before requests enter the existing worker pool.
+This bounds the effective Asset CAPS queue while avoiding behavioral changes in
+unrelated OpenSim modules that also use `ObjectJobEngine`.
+
+New source configuration:
+
+- `Cap_AssetMaxOutstanding = 0`
+- `Cap_AssetMaxOutstandingPerAgent = 0`
+
+`0` means disabled, preserving upstream-compatible behavior by default.
+DEV validation will explicitly use:
+
+- `Cap_AssetMaxOutstanding = 256`
+- `Cap_AssetMaxOutstandingPerAgent = 64`
+
+The outstanding count includes queued + currently processing Asset CAPS jobs.
+With 3 asset workers, this also bounds the underlying ObjectJobEngine queue.
+
+Behavior:
+
+- Requests inside capacity continue through the existing 3-worker path.
+- A single agent cannot occupy more than the configured per-agent limit.
+- Global capacity prevents unbounded aggregate Asset CAPS accumulation.
+- Rejected requests receive immediate HTTP 503 with `Retry-After: 1`.
+- Stage-3 event-driven response wake remains unchanged.
+- Existing PollService behavior remains unchanged.
+- No worker-count increase.
+- No RegionAsset local-worker change.
+
+New console commands:
+
+- `show asset queue`
+- `reset asset queue`
+
+Metrics include:
+
+- current / peak outstanding
+- active agents
+- peak active agents
+- peak per-agent outstanding
+- accepted / released
+- global capacity rejects
+- per-agent fairness rejects
+- worker enqueue failures
+
+CURRENT NEXT ACTION:
+
+1. Deploy the exact Stage-4 commit to DEV only.
+2. Keep `Cap_AssetWorkers = 3`.
+3. Keep `Cap_AssetResponseWake = true`.
+4. Enable DEV guard at 256 global / 64 per agent.
+5. Run the fixed 1000-asset benchmark at concurrency 32; expected: zero guard rejects and no material Stage-3 regression.
+6. Run a stress benchmark at concurrency 256; expected: controlled per-agent HTTP 503 backpressure instead of unbounded queue growth.
+7. Inspect `show asset pipeline` and `show asset queue`.
+8. Only after these measurements decide whether additional fairness scheduling or RegionAsset local-worker tuning is justified.
+9. LIVE `/nvme/opensim` remains untouched.
