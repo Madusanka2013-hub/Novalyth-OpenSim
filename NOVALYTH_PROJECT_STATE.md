@@ -911,3 +911,22 @@ Next:
 
 - Firestorm login + inventory read/write/rez sanity check;
 - then continue R2 inventory performance work: true batching, worker tuning, cache.
+
+## Deferred – Public Service URLs / Edge Architecture
+
+Status: **PLANNED / NOT NOW**
+
+- Public service URL separation will be implemented later.
+- Currently available domain: `db-rg.de`.
+- DNS/proxy provider: Cloudflare.
+- Do not expose internal Asset Core `127.0.0.1:8110` directly.
+- Do not expose internal Inventory Core `127.0.0.1:8120` directly.
+- Planned public edge/subdomain layout may use:
+  - `login.db-rg.de`
+  - `hg.db-rg.de`
+  - `assets.db-rg.de`
+  - `inventory.db-rg.de`
+  - `map.db-rg.de`
+- Firestorm should ultimately only require the public login/grid URI.
+- Public edges/proxies will route internally to the separated Novalyth cores.
+- This work is deferred until the current core/service architecture and performance work is further completed.
