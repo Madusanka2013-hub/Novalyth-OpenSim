@@ -1,5 +1,56 @@
 # NOVALYTH PROJECT STATE
 
+
+## PERMANENT ARCHITECTURE CHARTER — NOVALYTH IS THE PRODUCT
+
+**Status: PERMANENT / applies to every future chat and every architecture decision.**
+
+Novalyth is intended to become a **standalone grid platform**, not an "OpenSim grid with patches".
+OpenSimulator is only the current bootstrap/runtime kernel that lets the project start from a
+working SL-compatible base. Its responsibilities are to be replaced piece by piece until the
+executable grid system, services, process names, configuration surface, APIs and Novalyth-owned
+code are no longer OpenSim-owned.
+
+### Non-negotiable architecture rules
+
+1. **OpenSim is bootstrap, not target architecture.** New systems must not deepen dependency on
+   legacy OpenSim service architecture when a clean Novalyth boundary can be introduced.
+2. **Second Life is the primary behavioral/protocol reference.** For every major subsystem,
+   inspect documented Second Life behavior/protocols and the open viewer/Firestorm implementation
+   first. Preserve native Firestorm/SL interoperability wherever practical.
+3. **Match SL, then improve it.** Novalyth should reproduce the useful SL behavior, then improve
+   performance, batching, caching, concurrency, fairness, availability, operability and scaling
+   where modern architecture allows.
+4. **New ownership uses `Novalyth.*`.** New services/protocol layers should use Novalyth namespaces
+   and concepts. Existing `OpenSim.*` code is compatibility/bootstrap code scheduled for gradual
+   retirement; do not merely rename old classes and call that migration.
+5. **Regions do not own central state.** Inventory, assets, appearance/SSA, identity, presence,
+   groups, messaging, map and similar grid-wide state belong in dedicated Novalyth services.
+6. **Public SL/Firestorm compatibility, private Novalyth internals.** Viewer-facing protocol and
+   capability semantics remain SL-compatible; internal APIs, queues, caches and storage are
+   Novalyth-owned and may be better than Linden Lab/OpenSim implementations.
+7. **Core ports stay private.** Public traffic terminates at controlled edge/CAPS/login endpoints.
+   Raw service ports are internal only.
+8. **No fake migration by branding.** `OpenSim.dll`, `Robust.dll` and `OpenSim.*` assemblies are
+   removed/replaced only as their responsibilities genuinely move into Novalyth-owned hosts.
+9. **End-state process model:** `Novalyth.RegionHost`, `Novalyth.GridHost`,
+   `Novalyth.AssetCore`, `Novalyth.InventoryCore`, `Novalyth.AppearanceCore`,
+   `Novalyth.LoginCore`, `Novalyth.PresenceCore`, `Novalyth.GridCore`,
+   `Novalyth.Caps`, `Novalyth.Protocols`, `Novalyth.Storage` (names may evolve,
+   ownership principle does not).
+10. **Licensing remains correct.** Existing upstream copyright/license notices remain where
+    required. Product identity and runtime ownership can become fully Novalyth without erasing
+    third-party attribution obligations.
+
+### Migration direction
+
+`OpenSim bootstrap -> service extraction -> Novalyth-owned protocol/service boundaries ->
+Novalyth hosts -> legacy OpenSim compatibility island shrinks -> standalone Novalyth grid`.
+
+This charter must be carried into the generated chat handoff and treated as a hard constraint
+unless the project owner explicitly changes it.
+
+
 > **KANONISCHE PROJEKTÜBERGABE**
 >
 > Diese Datei ist die dauerhafte fachliche Wahrheit des Novalyth-OpenSim-Projekts.
@@ -1295,3 +1346,20 @@ Viewer validation:
 - Final architecture phase after that: true server-side bake compositor and only then enable CentralBakeVersion.
 - DEV Region only was restarted.
 - DEV Robust, Asset Core, Inventory Core and LIVE remained untouched.
+
+## Appearance Core Phase B – SL SSA protocol surface (20260814-121303)
+
+- Base commit: `2cd3beefa5295c1f67085820e213b1773bab7025`
+- Novalyth-owned server component: `Novalyth.Server.Appearance.NovalythAppearanceStateConnector`.
+- Novalyth-owned region protocol component: `Novalyth.Region.Appearance.NovalythServerSideAppearanceModule`.
+- Appearance Core :8130 owns persistent COF/appearance protocol state.
+- State storage is service-owned and sharded under `/nvme/novalyth-opensim-dev/appearance-state`; regions do not persist SSA state.
+- Internal service calls use a dedicated random service token.
+- Viewer-facing SL capability names implemented: `UpdateAvatarAppearance` and `IncrementCOFVersion`.
+- `UpdateAvatarAppearance` accepts the viewer's `cof_version` and implements stale-version semantics with `expected`.
+- `IncrementCOFVersion` returns the current incremented `version`, matching the SL/Firestorm synchronization model.
+- Phase B deliberately reports `server_bake_not_active` for bake requests because the compositor is not built yet.
+- **CentralBakeVersion remains disabled.** Firestorm must not be switched into SSA until Phase C can really bake.
+- Phase C: server bake compositor, appearance-version advancement, persistent bake manifest, Asset Core integration.
+- Only Appearance Core and DEV Region are restarted for this phase.
+- DEV Robust, Asset Core, Inventory Core and LIVE remain untouched.
