@@ -68,6 +68,11 @@ namespace OpenSim.Region.ClientStack.LindenUDP
         /// </summary>
         private object m_syncRoot = new object();
 
+        // NOVALYTH TEXTURE PIPELINE R1:
+        // Log the first real head-of-line bypass for this client.  The bypass
+        // itself can happen repeatedly; the log must not become texture spam.
+        private bool m_novalythLoggedHeadOfLineBypass;
+
         /// <summary>
         /// Client served by this image manager
         /// </summary>
@@ -202,28 +207,37 @@ namespace OpenSim.Region.ClientStack.LindenUDP
                 if (image == null)
                     break;
 
-                if (image.IsDecoded)
+                if (!image.IsDecoded)
                 {
-                    int sent;
-                    bool imageDone = image.SendPackets(Client, packetsToSend - packetsSent, out sent);
-                    packetsSent += sent;
+                    // NOVALYTH TEXTURE PIPELINE R1:
+                    // Upstream stops the entire client texture pipeline when the
+                    // highest-priority request is still waiting for its asset/J2K
+                    // decode.  Keep that request queued at its original priority,
+                    // but allow the highest-priority *ready* image to make progress.
+                    // When the blocked request finishes decoding it automatically
+                    // becomes eligible again on the next processing cycle.
+                    J2KImage readyImage = GetHighestPriorityDecodedImage();
+                    if (readyImage == null)
+                        break;
 
-                    // If the send is complete, destroy any knowledge of this transfer
-                    if (imageDone)
-                        RemoveImageFromQueue(image);
-                }
-                else
-                {
-                    // TODO: This is a limitation of how LLImageManager is currently
-                    // written. Undecoded textures should not be going into the priority
-                    // queue, because a high priority undecoded texture will clog up the
-                    // pipeline for a client
-//                    m_log.DebugFormat(
-//                        "[LL IMAGE MANAGER]: Exiting image queue processing early on encountering undecoded image {0}",
-//                        image.TextureID);
+                    image = readyImage;
 
-                    break;
+                    if (!m_novalythLoggedHeadOfLineBypass)
+                    {
+                        m_novalythLoggedHeadOfLineBypass = true;
+                        m_log.InfoFormat(
+                            "[NOVALYTH TEXTURE PIPELINE]: bypassed undecoded queue head for {0}; decoded texture traffic continues",
+                            Client.Name);
+                    }
                 }
+
+                int sent;
+                bool imageDone = image.SendPackets(Client, packetsToSend - packetsSent, out sent);
+                packetsSent += sent;
+
+                // If the send is complete, destroy any knowledge of this transfer
+                if (imageDone)
+                    RemoveImageFromQueue(image);
             }
 
 //            if (packetsSent != 0)
@@ -288,6 +302,33 @@ namespace OpenSim.Region.ClientStack.LindenUDP
                 }
             }
             return image;
+        }
+
+        // Return the highest-priority request that is actually ready to send.
+        // The queue is intentionally not mutated here: undecoded requests keep
+        // their priority and re-enter normal scheduling as soon as decoding ends.
+        private J2KImage GetHighestPriorityDecodedImage()
+        {
+            J2KImage best = null;
+
+            lock (m_syncRoot)
+            {
+                try
+                {
+                    J2KImage[] images = m_priorityQueue.ToArray();
+                    foreach (J2KImage candidate in images)
+                    {
+                        if (!candidate.IsDecoded)
+                            continue;
+
+                        if (best == null || candidate.Priority > best.Priority)
+                            best = candidate;
+                    }
+                }
+                catch (Exception) { }
+            }
+
+            return best;
         }
 
         private void AddImageToQueue(J2KImage image)

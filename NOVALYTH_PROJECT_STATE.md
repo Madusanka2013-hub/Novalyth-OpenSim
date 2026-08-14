@@ -1269,3 +1269,14 @@ Viewer validation:
 - Ordinary teleports do not arm this recovery.
 - DEV Region only was restarted.
 - Asset Core, Inventory Core, DEV Robust and LIVE remained untouched.
+
+## Texture Pipeline R1 – remove undecoded head-of-line blocking (20260814-082240)
+
+- Base commit: `a608fc38fbd2265c4d3451c3d032217f3090b0f7`
+- OpenSim LLImageManager upstream behavior stopped an entire client's texture send cycle when the highest-priority image had not completed asset fetch/J2K decode.
+- Novalyth keeps undecoded requests queued at their original priority but selects the highest-priority decoded request when the queue head is not ready.
+- A blocked high-priority request becomes eligible normally as soon as its asynchronous decode completes.
+- No request is dropped and no extra worker pool is introduced.
+- One informational marker per client confirms a real runtime bypass without per-texture log spam.
+- DEV Region only was restarted.
+- Asset Core, Inventory Core, DEV Robust and LIVE remained untouched.
