@@ -1523,3 +1523,36 @@ Viewer validation:
   range 0..2000). No INI change is required for the default.
 - This step is source/build/commit only. No DEV runtime deployment, no restart, no
   runtime INI mutation and no LIVE `/nvme/opensim` changes are performed.
+
+## Appearance C4B – maximum-performance 2K texture delivery (20260814-203911)
+
+- Base commit: `a6dcb703907c23771666a4bc969ab9c39a9f5435` (C4A atomic server-bake publish bridge).
+- Goal: Second-Life-compatible progressive J2K delivery with a faster Novalyth
+  server path for 2K avatar bakes and normal textures.
+- `GetAssetsHandler` now contains a bounded process-wide immutable texture RAM
+  hot-cache. HTTP Range requests for a cached texture are served from the same
+  in-process `byte[]` instead of re-entering the Asset Service for every range.
+- Local texture first-fetch uses 256 striped single-flight locks, preventing
+  simultaneous first ranges for the same UUID from multiplying Asset Core fetches.
+- Default hot-cache policy: 512 MB, 900 s TTL, 16 MB max single texture; config keys:
+  `Cap_TextureHotCacheMB`, `Cap_TextureHotCacheTTLSeconds`,
+  `Cap_TextureHotCacheMaxAssetMB`. Cache is bounded and evicts non-bake-prime
+  least-recently-used entries before bake-prime entries.
+- Texture responses explicitly advertise HTTP ranges, immutable one-year caching,
+  ETag, keep-alive, higher response priority, and an `X-Novalyth-Texture-Hot`
+  HIT/MISS diagnostic header.
+- CAPS asset worker default rises from 3 to 8 (still configurable 1..64).
+- `Cap_AssetResponseWake` default becomes true so completed texture responses wake
+  immediately rather than waiting for a later poll cycle.
+- New console diagnostics: `show texture hot cache` and
+  `reset texture hot cache`.
+- C4A publish bridge now fetch-validates and parallel-prewarms all 11 completed bake
+  assets into the Region texture hot-cache before atomically publishing their UUIDs.
+  Default `BakePrewarmParallelism=4` (range 1..11).
+- Correctness remains independent of the performance cache: missing/invalid bake
+  assets block publication and preserve last-known-good; cache rejection alone does
+  not block publication.
+- C4B closes the generation race during prewarm: if a newer outfit arrives before
+  publication, the warmed stale generation is suppressed and never sent.
+- Source/build/commit only. No DEV runtime deployment/restart/INI mutation and no
+  LIVE `/nvme/opensim` changes are performed by this step.

@@ -56,8 +56,13 @@ namespace OpenSim.Region.ClientStack.Linden
 
         private Scene m_scene;
         private bool m_Enabled;
-        private int m_capsAssetWorkers = 3;
+        // C4B: eight workers is the low-latency baseline for modern HTTP/J2K
+        // texture traffic. Operators can still tune 1..64 in the INI.
+        private int m_capsAssetWorkers = 8;
         private int m_assetFetchTimeoutMs = 15000;
+        private int m_textureHotCacheMB = 512;
+        private int m_textureHotCacheTTLSeconds = 900;
+        private int m_textureHotCacheMaxAssetMB = 16;
 
         private string m_GetTextureURL;
         private string m_GetMeshURL;
@@ -91,7 +96,7 @@ namespace OpenSim.Region.ClientStack.Linden
         private static int m_assetMaxOutstanding = 0;
         private static int m_assetMaxOutstandingPerAgent = 0;
         private static int m_queueCommandsRegistered = 0;
-        private static int m_assetFairDispatchSlots = 3;
+        private static int m_assetFairDispatchSlots = 8;
         private static bool m_assetFairStopping = false;
 
         private static readonly object m_assetFairLock = new();
@@ -367,10 +372,24 @@ namespace OpenSim.Region.ClientStack.Linden
             if (config == null)
                 return;
 
-            m_capsAssetWorkers = Math.Clamp(config.GetInt("Cap_AssetWorkers", 3), 1, 64);
+            m_capsAssetWorkers = Math.Clamp(config.GetInt("Cap_AssetWorkers", 8), 1, 64);
             m_assetFetchTimeoutMs = Math.Clamp(
                 config.GetInt("Cap_AssetFetchTimeoutMs", 15000), 1000, 120000);
-            m_assetResponseWake = config.GetBoolean("Cap_AssetResponseWake", false);
+            // Wake the poll response immediately when a worker finishes rather
+            // than waiting for the next poll tick. This directly improves
+            // time-to-first-range for progressive J2K textures.
+            m_assetResponseWake = config.GetBoolean("Cap_AssetResponseWake", true);
+            m_textureHotCacheMB = Math.Clamp(
+                config.GetInt("Cap_TextureHotCacheMB", 512), 0, 4096);
+            m_textureHotCacheTTLSeconds = Math.Clamp(
+                config.GetInt("Cap_TextureHotCacheTTLSeconds", 900), 30, 86400);
+            m_textureHotCacheMaxAssetMB = Math.Clamp(
+                config.GetInt("Cap_TextureHotCacheMaxAssetMB", 16), 1, 64);
+
+            GetAssetsHandler.ConfigureTextureHotCache(
+                m_textureHotCacheMB,
+                m_textureHotCacheTTLSeconds,
+                m_textureHotCacheMaxAssetMB);
             m_assetMaxOutstanding = Math.Clamp(
                 config.GetInt("Cap_AssetMaxOutstanding", 0), 0, 8192);
             m_assetMaxOutstandingPerAgent = Math.Clamp(
@@ -475,6 +494,12 @@ namespace OpenSim.Region.ClientStack.Linden
                     m_log.InfoFormat(
                         "[GETASSETS]: fair asset dispatch=enabled, dispatch_slots={0}",
                         m_capsAssetWorkers);
+                    m_log.InfoFormat(
+                        "[NOVALYTH TEXTURE C4B]: hot-cache max={0}MB ttl={1}s max_asset={2}MB; response_wake={3}",
+                        m_textureHotCacheMB,
+                        m_textureHotCacheTTLSeconds,
+                        m_textureHotCacheMaxAssetMB,
+                        m_assetResponseWake ? "enabled" : "disabled");
                 }
 
                 if (Interlocked.CompareExchange(ref m_commandsRegistered, 1, 0) == 0)
@@ -489,6 +514,16 @@ namespace OpenSim.Region.ClientStack.Linden
                         "reset asset pipeline", "reset asset pipeline",
                         "Reset Novalyth asset pipeline metrics",
                         HandleResetAssetPipeline);
+                    MainConsole.Instance.Commands.AddCommand(
+                        "Novalyth", false,
+                        "show texture hot cache", "show texture hot cache",
+                        "Show Novalyth C4B texture RAM hot-cache metrics",
+                        HandleShowTextureHotCache);
+                    MainConsole.Instance.Commands.AddCommand(
+                        "Novalyth", false,
+                        "reset texture hot cache", "reset texture hot cache",
+                        "Reset Novalyth C4B texture hot-cache counters",
+                        HandleResetTextureHotCache);
                 }
             }
         }
@@ -565,6 +600,23 @@ namespace OpenSim.Region.ClientStack.Linden
             }
         }
 
+
+        private static void HandleShowTextureHotCache(
+            string module,
+            string[] args)
+        {
+            MainConsole.Instance.Output(
+                GetAssetsHandler.GetTextureHotCacheReport());
+        }
+
+        private static void HandleResetTextureHotCache(
+            string module,
+            string[] args)
+        {
+            GetAssetsHandler.ResetTextureHotCacheMetrics();
+            MainConsole.Instance.Output(
+                "[NOVALYTH TEXTURE C4B] hot-cache counters reset.");
+        }
 
         private static void HandleResetAssetPipeline(string module, string[] args)
         {

@@ -11,14 +11,18 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading;
+using System.Threading.Tasks;
 using log4net;
 using Mono.Addins;
 using Nini.Config;
 using OpenMetaverse;
 using OpenMetaverse.StructuredData;
+using OpenSim.Capabilities.Handlers;
+using OpenSim.Framework;
 using OpenSim.Framework.Servers.HttpServer;
 using OpenSim.Region.Framework.Interfaces;
 using OpenSim.Region.Framework.Scenes;
+using OpenSim.Services.Interfaces;
 using Caps = OpenSim.Framework.Capabilities.Caps;
 
 namespace Novalyth.Region.Appearance
@@ -71,6 +75,7 @@ namespace Novalyth.Region.Appearance
         private bool m_advertiseCentralBake;
         private int m_centralBakeVersion = 1;
         private int m_bakeCoalesceMilliseconds = 75;
+        private int m_bakePrewarmParallelism = 4;
         private string m_serviceURI = string.Empty;
         private string m_serviceToken = string.Empty;
 
@@ -91,6 +96,8 @@ namespace Novalyth.Region.Appearance
                 Math.Max(1, config.GetInt("CentralBakeVersion", 1));
             m_bakeCoalesceMilliseconds =
                 Math.Clamp(config.GetInt("BakeCoalesceMilliseconds", 75), 0, 2000);
+            m_bakePrewarmParallelism =
+                Math.Clamp(config.GetInt("BakePrewarmParallelism", 4), 1, 11);
             m_serviceURI =
                 config.GetString("ServiceURI", string.Empty).TrimEnd('/');
             m_serviceToken =
@@ -108,9 +115,10 @@ namespace Novalyth.Region.Appearance
             if (m_advertiseCentralBake)
             {
                 m_log.WarnFormat(
-                    "[NOVALYTH SSA C4A]: viewer advertisement armed; CentralBakeVersion={0}; coalesce={1}ms; publish=last-known-good->atomic-server-bake",
+                    "[NOVALYTH SSA C4B]: viewer advertisement armed; CentralBakeVersion={0}; coalesce={1}ms; prewarm_parallel={2}; publish=RAM-hot->atomic-server-bake",
                     m_centralBakeVersion,
-                    m_bakeCoalesceMilliseconds);
+                    m_bakeCoalesceMilliseconds,
+                    m_bakePrewarmParallelism);
             }
         }
 
@@ -370,6 +378,8 @@ namespace Novalyth.Region.Appearance
                 if (!TryPublishServerBake(
                         agentID,
                         manifest,
+                        state,
+                        targetGeneration,
                         out string publishError))
                 {
                     bool retry;
@@ -380,11 +390,21 @@ namespace Novalyth.Region.Appearance
                             state.WorkerRunning = false;
                     }
 
-                    m_log.ErrorFormat(
-                        "[NOVALYTH SSA C4A]: server bake publish failed agent={0} generation={1} error={2}; last-known-good preserved",
-                        agentID,
-                        targetGeneration,
-                        publishError);
+                    if (retry && publishError == "stale_generation_during_prewarm")
+                    {
+                        m_log.InfoFormat(
+                            "[NOVALYTH SSA C4B]: stale generation suppressed during prewarm agent={0} built_generation={1}; newest generation will continue",
+                            agentID,
+                            targetGeneration);
+                    }
+                    else
+                    {
+                        m_log.ErrorFormat(
+                            "[NOVALYTH SSA C4B]: server bake publish failed agent={0} generation={1} error={2}; last-known-good preserved",
+                            agentID,
+                            targetGeneration,
+                            publishError);
+                    }
 
                     if (retry)
                         continue;
@@ -404,7 +424,7 @@ namespace Novalyth.Region.Appearance
                 }
 
                 m_log.InfoFormat(
-                    "[NOVALYTH SSA C4A]: atomic server appearance published agent={0} generation={1} cof={2} recipe={3} slots=11 elapsed_ms={4}",
+                    "[NOVALYTH SSA C4B]: atomic RAM-hot server appearance published agent={0} generation={1} cof={2} recipe={3} slots=11 elapsed_ms={4}",
                     agentID,
                     targetGeneration,
                     manifest["cof_version"].AsInteger(),
@@ -478,6 +498,8 @@ namespace Novalyth.Region.Appearance
         private bool TryPublishServerBake(
             UUID agentID,
             OSDMap manifest,
+            BakeWorkState state,
+            long targetGeneration,
             out string error)
         {
             error = string.Empty;
@@ -494,6 +516,7 @@ namespace Novalyth.Region.Appearance
                     AppearanceManager.DEFAULT_AVATAR_TEXTURE);
 
             int validBakes = 0;
+            List<UUID> bakeAssetIDs = new();
 
             foreach (OSD entry in bakes)
             {
@@ -515,6 +538,7 @@ namespace Novalyth.Region.Appearance
                 Primitive.TextureEntryFace face =
                     textureEntry.GetFace(textureIndex);
                 face.TextureID = assetID;
+                bakeAssetIDs.Add(assetID);
                 validBakes++;
             }
 
@@ -530,6 +554,38 @@ namespace Novalyth.Region.Appearance
                 error = "root_presence_not_found";
                 return false;
             }
+
+            long prewarmStarted = Environment.TickCount64;
+            if (!TryPrewarmBakeAssets(
+                    sp,
+                    bakeAssetIDs,
+                    out int primed,
+                    out long primedBytes,
+                    out string prewarmError))
+            {
+                error = "bake_prewarm_failed:" + prewarmError;
+                return false;
+            }
+
+            // Close the only remaining C4A race: an outfit can change while the
+            // just-completed generation is being prewarmed. Never publish that
+            // generation if a newer request arrived during the hot-cache fill.
+            lock (state.Sync)
+            {
+                if (state.RequestedGeneration != targetGeneration)
+                {
+                    error = "stale_generation_during_prewarm";
+                    return false;
+                }
+            }
+
+            m_log.InfoFormat(
+                "[NOVALYTH SSA C4B]: bake prewarm complete agent={0} generation={1} primed={2}/11 bytes={3} elapsed_ms={4}",
+                agentID,
+                targetGeneration,
+                primed,
+                primedBytes,
+                Environment.TickCount64 - prewarmStarted);
 
             IAvatarFactoryModule factory =
                 sp.Scene.RequestModuleInterface<IAvatarFactoryModule>();
@@ -554,6 +610,86 @@ namespace Novalyth.Region.Appearance
             sp.SendAppearanceToAgentNF(sp);
             sp.SendAppearanceToAllOtherAgents();
 
+            return true;
+        }
+
+        private bool TryPrewarmBakeAssets(
+            ScenePresence sp,
+            List<UUID> bakeAssetIDs,
+            out int primed,
+            out long primedBytes,
+            out string error)
+        {
+            primed = 0;
+            primedBytes = 0;
+            error = string.Empty;
+
+            if (sp == null || bakeAssetIDs == null || bakeAssetIDs.Count != 11)
+            {
+                error = "invalid_prewarm_input";
+                return false;
+            }
+
+            IAssetService assets =
+                sp.Scene.RequestModuleInterface<IAssetService>();
+            if (assets == null)
+            {
+                error = "asset_service_unavailable";
+                return false;
+            }
+
+            ConcurrentQueue<string> failures = new();
+            int primeCount = 0;
+            long byteCount = 0;
+
+            System.Threading.Tasks.Parallel.ForEach(
+                bakeAssetIDs,
+                new System.Threading.Tasks.ParallelOptions
+                {
+                    MaxDegreeOfParallelism = m_bakePrewarmParallelism
+                },
+                assetID =>
+                {
+                    try
+                    {
+                        AssetBase asset = assets.Get(assetID.ToString());
+                        if (asset == null)
+                        {
+                            failures.Enqueue("missing:" + assetID);
+                            return;
+                        }
+
+                        if (asset.Type != (sbyte)AssetType.Texture ||
+                            asset.Data == null ||
+                            asset.Data.Length == 0)
+                        {
+                            failures.Enqueue("invalid_texture:" + assetID);
+                            return;
+                        }
+
+                        // Performance hint only: validation above is correctness;
+                        // cache rejection must never make appearance publishing
+                        // impossible if an operator intentionally disables C4B.
+                        if (GetAssetsHandler.PrimeTextureAsset(asset))
+                            Interlocked.Increment(ref primeCount);
+
+                        Interlocked.Add(ref byteCount, asset.Data.Length);
+                    }
+                    catch (Exception e)
+                    {
+                        failures.Enqueue(
+                            assetID + ":" + e.GetType().Name + ":" + e.Message);
+                    }
+                });
+
+            if (!failures.IsEmpty)
+            {
+                error = string.Join("|", failures);
+                return false;
+            }
+
+            primed = primeCount;
+            primedBytes = byteCount;
             return true;
         }
 
