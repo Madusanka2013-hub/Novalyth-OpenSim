@@ -78,6 +78,11 @@ namespace OpenSim.Data.MySQL
             return m_Folders.Get("folderID", folderIDs);
         }
 
+        public XInventoryItem[] GetItemsByIDs(string[] itemIDs)
+        {
+            return m_Items.Get("inventoryID", itemIDs);
+        }
+
         public bool StoreFolder(XInventoryFolder folder)
         {
             if (folder.folderName.Length > 64)

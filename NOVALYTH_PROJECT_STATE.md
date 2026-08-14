@@ -1105,3 +1105,54 @@ Next:
 - no blind worker-count tuning;
 - perform targeted Inventory method/path audit for remaining N+1 DB patterns,
   especially skeleton/type/item lookup and mutation-side redundant reads.
+
+## R2 Inventory Performance – Native Multi-Item Batching
+
+Status: **DEV RUNTIME VALIDATED**
+
+Date: 2026-08-14
+
+Audit finding:
+
+- `GetInventorySkeleton()` already performs one database read for all folders;
+- `GetFolderForType()` performs targeted root + system-folder lookups and is not
+  an N+1 path;
+- `GetActiveGestures()` and `GetAssetPermissions()` already use single targeted
+  database queries;
+- `AddFolder()` / `UpdateFolder()` contain consistency and version checks whose
+  prerequisite reads were deliberately preserved;
+- `GetMultipleItems()` was a true N+1 path: the service looped over requested
+  IDs and called `GetItem()` once per item.
+
+Implementation:
+
+- optional `IXInventoryDataBatch` now exposes `GetItemsByIDs`;
+- MySQL/MariaDB maps it to the existing parameterized generic
+  `inventoryID IN (...)` query implementation;
+- `XInventoryService.GetMultipleItems()` now performs one backend query for any
+  number of item IDs when the batch capability exists;
+- requested item order and missing-item null positions are preserved;
+- duplicate requested IDs remain supported;
+- non-batch providers and runtime batch failures keep the legacy implementation.
+
+Validation:
+
+- solution built successfully before runtime deployment;
+- only Inventory Core was restarted;
+- native DB batching and central Core Admission remained active;
+- real direct-core `GETMULTIPLEITEMS` request executed the new native path;
+- pre/post HTTP responses were byte-identical;
+- no legacy fallback occurred;
+- Asset Core, DEV Robust and DEV Region were not restarted;
+- LIVE `/nvme/opensim` remained untouched.
+
+Current read-path reductions:
+
+- multi-folder content: approximately `3 × N` database reads -> `3` reads;
+- multi-item lookup: `N` database reads -> `1` read.
+
+Next:
+
+- audit mutation-side database handlers for repeated connection opens and
+  version increments;
+- prioritize transaction/connection reuse only where semantics stay identical.

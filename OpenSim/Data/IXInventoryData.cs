@@ -86,6 +86,7 @@ namespace OpenSim.Data
         XInventoryFolder[] GetFoldersByParentIDs(string[] parentFolderIDs);
         XInventoryItem[] GetItemsByParentIDs(string[] parentFolderIDs);
         XInventoryFolder[] GetFoldersByIDs(string[] folderIDs);
+        XInventoryItem[] GetItemsByIDs(string[] itemIDs);
     }
 
     public interface IXInventoryData

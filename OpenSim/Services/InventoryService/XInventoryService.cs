@@ -45,6 +45,7 @@ namespace OpenSim.Services.InventoryService
         protected IXInventoryData m_Database;
         protected IXInventoryDataBatch m_BatchDatabase;
         private int m_NativeBatchLogOnce;
+        private int m_NativeMultiItemBatchLogOnce;
         protected bool m_AllowDelete = true;
         protected string m_ConfigName = "InventoryService";
 
@@ -724,12 +725,73 @@ namespace OpenSim.Services.InventoryService
 
         public virtual InventoryItemBase[] GetMultipleItems(UUID userID, UUID[] ids)
         {
-            InventoryItemBase[] items = new InventoryItemBase[ids.Length];
-            int i = 0;
-            foreach (UUID id in ids)
-                items[i++] = GetItem(userID, id);
+            if (ids == null || ids.Length == 0)
+                return [];
 
-            return items;
+            if (m_BatchDatabase == null)
+            {
+                InventoryItemBase[] legacy = new InventoryItemBase[ids.Length];
+                int legacyIndex = 0;
+
+                foreach (UUID id in ids)
+                    legacy[legacyIndex++] = GetItem(userID, id);
+
+                return legacy;
+            }
+
+            try
+            {
+                if (System.Threading.Interlocked.Exchange(
+                        ref m_NativeMultiItemBatchLogOnce, 1) == 0)
+                {
+                    m_log.InfoFormat(
+                        "[NOVALYTH INVENTORY BATCH]: Native multi-item path active; first request items={0}, backend queries=1",
+                        ids.Length);
+                }
+
+                string[] itemIDStrings = new string[ids.Length];
+
+                for (int i = 0; i < ids.Length; ++i)
+                    itemIDStrings[i] = ids[i].ToString();
+
+                XInventoryItem[] rows =
+                    m_BatchDatabase.GetItemsByIDs(itemIDStrings);
+
+                Dictionary<UUID, XInventoryItem> byID =
+                    new(rows.Length);
+
+                foreach (XInventoryItem row in rows)
+                    byID[row.inventoryID] = row;
+
+                InventoryItemBase[] items =
+                    new InventoryItemBase[ids.Length];
+
+                for (int i = 0; i < ids.Length; ++i)
+                {
+                    if (byID.TryGetValue(ids[i], out XInventoryItem row))
+                        items[i] = ConvertToOpenSim(row);
+                    else
+                        items[i] = null;
+                }
+
+                return items;
+            }
+            catch (Exception e)
+            {
+                m_log.WarnFormat(
+                    "[NOVALYTH INVENTORY BATCH]: Native multi-item batch failed, using legacy path: {0}",
+                    e.Message);
+
+                InventoryItemBase[] legacy =
+                    new InventoryItemBase[ids.Length];
+
+                int legacyIndex = 0;
+
+                foreach (UUID id in ids)
+                    legacy[legacyIndex++] = GetItem(userID, id);
+
+                return legacy;
+            }
         }
 
         public virtual InventoryFolderBase GetFolder(UUID principalID, UUID folderID)
