@@ -30,6 +30,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Threading;
 using OpenMetaverse;
+using OpenMetaverse.StructuredData;
 using log4net;
 using Nini.Config;
 using OpenSim.Framework;
@@ -187,6 +188,27 @@ namespace OpenSim.Region.Framework.Scenes
 
             return appearanceVersion > 0 &&
                    cofVersion >= 0;
+        }
+
+        // NOVALYTH SSA C5
+        // CompleteMovement runs immediately after SendRegionHandshake and can
+        // beat RegionHandshakeReply. Do not inspect viewer bit 4 here. The
+        // CentralBake advertisement defers legacy cache validation until the
+        // first handshake-aware appearance packet.
+        private bool IsNovalythCentralBakeRegion()
+        {
+            ISimulatorFeaturesModule simulatorFeatures =
+                m_scene?.RequestModuleInterface<ISimulatorFeaturesModule>();
+
+            if (simulatorFeatures == null ||
+                !simulatorFeatures.TryGetFeature(
+                    "CentralBakeVersion",
+                    out OSD centralBakeVersion))
+            {
+                return false;
+            }
+
+            return centralBakeVersion.AsInteger() > 0;
         }
 
         public void MarkNovalythLoginBakeRecoveryPending()
@@ -2351,19 +2373,29 @@ namespace OpenSim.Region.Framework.Scenes
                         ParentPart.ParentGroup.SendFullAnimUpdateToClient(ControllingClient);
                     }
 
-                    // verify baked textures and cache
-                    if (m_scene.AvatarFactory != null && !isHGTP)
+                    // NOVALYTH SSA C5:
+                    // Do not let legacy XBakes restore old baked UUIDs during
+                    // CompleteMovement on a server-side-bake region. The viewer
+                    // handshake reply can still be in flight here, so defer the
+                    // legacy decision until the first SetAppearance.
+                    if (!isHGTP &&
+                        IsNovalythCentralBakeRegion())
+                    {
+                        if ((m_teleportFlags & TeleportFlags.ViaLogin) != 0)
+                        {
+                            MarkNovalythLoginBakeRecoveryPending();
+
+                            m_log.InfoFormat(
+                                "[NOVALYTH SSA C5]: deferred legacy XBakes login cache validation for {0}; waiting for viewer handshake-aware appearance path",
+                                Name);
+                        }
+                    }
+                    else if (m_scene.AvatarFactory != null && !isHGTP)
                     {
                         if (!m_scene.AvatarFactory.ValidateBakedTextureCache(this))
                         {
                             m_scene.AvatarFactory.QueueAppearanceSave(UUID);
 
-                            // NOVALYTH APPEARANCE R2:
-                            // At CompleteMovement Firestorm can still be several seconds away
-                            // from sending its current baked texture IDs. Do not issue a
-                            // guaranteed-empty rebake request here. Arm a one-shot recovery
-                            // that AvatarFactory consumes immediately after the viewer's first
-                            // SetAppearance update.
                             if ((m_teleportFlags & TeleportFlags.ViaLogin) != 0)
                             {
                                 MarkNovalythLoginBakeRecoveryPending();

@@ -1721,3 +1721,42 @@ C4D4:
 
 No C4D3 protocol rollback. No runtime deploy/restart/INI/LIVE change in this
 source-only step.
+
+## Appearance C5 – consolidated SL-reference correctness pass
+
+C4D4 still produced visibly corrupted fresh pixels after a full recomposite.
+A full audit compared Novalyth against:
+- pinned Second Life viewer commit
+  `dcff8c97ea5448f0acaff76fa0a74a89889be678`,
+- pinned normalized avatar_lad SHA
+  `83380dcc2cbc3bce0e74b9429a2da3f7b701756c74248b6edeef6b61c96c20da`,
+- libOpenMetaverse reference commit
+  `f3ee229dc2a17e0dfd7256f8f634afe8e7610487`.
+
+Confirmed C5 fixes:
+1. Pixel-engine fingerprint participates in recipe/reuse/asset identity.
+2. Real skin bodypaint gets neither extra tint nor param masks.
+3. Global/layer colors use viewer Add/Multiply/Blend semantics.
+4. Per-texture colors use VisualColorParam ramps, never raw slider-as-RGB.
+5. Head skin/tattoo ordering follows the reference special path.
+6. Alpha wearable/visibility masks are a final pass.
+7. `write_all_channels` is parsed and uses RGBA replacement.
+8. `local_texture_alpha_only` is parsed and honored.
+9. `morph_mask` presence feeds the baked morph/bump channel.
+10. Local texture is rendered before static texture in the same layer.
+11. avatar_lad param alpha masks use normal-union then multiply semantics.
+12. A CentralBake region defers legacy XBakes login validation because
+    CompleteMovement can run before RegionHandshakeReply.
+13. The first handshake-aware appearance packet decides the path:
+    negotiated SSA discards deferred XBakes recovery; non-SSA viewers consume
+    the existing R2 recovery and retain the legacy fallback.
+
+C4D3 authoritative AppearanceData/COF protocol and mutation guards stay enabled.
+
+The repeated GETASSET empty-data UUIDs are not guessed/deleted. If they remain
+after legacy XBakes is removed from the SSA login path, trace their real owner.
+
+Performance changes are intentionally excluded until pixel correctness passes.
+
+Source/build/commit only. No runtime deploy, restart, INI change, cache deletion
+or LIVE `/nvme/opensim` mutation in this step.

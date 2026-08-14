@@ -1230,6 +1230,21 @@ namespace OpenSim.Region.CoreModules.Avatar.AvatarFactory
             {
                 if (IsAuthoritativeServerAppearanceClient(client))
                 {
+                    // NOVALYTH SSA C5:
+                    // CompleteMovement deliberately deferred the legacy XBakes
+                    // decision. Once the viewer handshake confirms SSA, discard
+                    // that one-shot legacy recovery and keep Appearance Core as
+                    // the sole bake authority.
+                    bool discardedLegacyRecovery =
+                        sp.TryConsumeNovalythLoginBakeRecovery();
+
+                    if (discardedLegacyRecovery)
+                    {
+                        m_log.InfoFormat(
+                            "[NOVALYTH SSA C5]: discarded deferred legacy XBakes recovery agent={0}; negotiated SSA is authoritative",
+                            client.AgentId);
+                    }
+
                     // In SSA the COF/Appearance Core is authoritative. A viewer
                     // AgentSetAppearance may still be emitted for local editing/
                     // legacy compatibility, but its client-side bake UUIDs must
