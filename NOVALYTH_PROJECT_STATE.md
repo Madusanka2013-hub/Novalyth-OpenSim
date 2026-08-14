@@ -1556,3 +1556,24 @@ Viewer validation:
   publication, the warmed stale generation is suppressed and never sent.
 - Source/build/commit only. No DEV runtime deployment/restart/INI mutation and no
   LIVE `/nvme/opensim` changes are performed by this step.
+
+## Appearance C4C – RegionHandshake SSA activation
+
+- Base commit: `d3375da1cc7bde8569c387c87d065706289ab415` (C4B texture fast path).
+- Root cause found from the pinned official Second Life viewer source
+  `dcff8c97ea5448f0acaff76fa0a74a89889be678`:
+  the viewer derives its region `CentralBakeVersion` from
+  `RegionInfo4.RegionProtocols & 1`.
+- Existing OpenSim handshake already documents bit 0 as server-side texture baking
+  and bit 63 as support for more than six baked textures, but transmitted only
+  bit 63.
+- C4C keeps bit 63 and dynamically sets bit 0 only when the active region's
+  `ISimulatorFeaturesModule` reports `CentralBakeVersion > 0`.
+- RegionHandshakeReply handling logs the raw viewer flags and preserves bit 2
+  (`0x4`, self-appearance/SSA-capable viewer) even when viewer object-cache probes
+  are disabled.
+- Expected Firestorm validation after DEV deploy/restart:
+  C4C handshake bit0 -> viewer reply bit4 -> UpdateAvatarAppearance ->
+  C4B prewarm 11/11 -> atomic RAM-hot appearance publish.
+- Source/build/commit only. No runtime deploy, no restart, no INI mutation and no
+  LIVE `/nvme/opensim` change are performed by this step.

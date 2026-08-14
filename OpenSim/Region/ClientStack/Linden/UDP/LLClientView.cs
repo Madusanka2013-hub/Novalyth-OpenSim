@@ -984,7 +984,31 @@ namespace OpenSim.Region.ClientStack.LindenUDP
             //RegionProtocols
                 // bit 0 signals server side texture baking
                 // bit 63 signals more than 6 baked textures support"
-            zc.AddUInt64(1UL << 63);
+            ulong regionProtocols = 1UL << 63;
+
+            // NOVALYTH SSA C4C
+            // Current SL/Firestorm viewers derive CentralBakeVersion from
+            // RegionInfo4.RegionProtocols bit 0. Keep bit 63 for >6 bake slots,
+            // and advertise bit 0 only when our SSA feature is actually enabled.
+            ISimulatorFeaturesModule simulatorFeatures =
+                m_scene.RequestModuleInterface<ISimulatorFeaturesModule>();
+
+            if (simulatorFeatures != null &&
+                simulatorFeatures.TryGetFeature(
+                    "CentralBakeVersion",
+                    out OSD centralBakeVersion) &&
+                centralBakeVersion.AsInteger() > 0)
+            {
+                regionProtocols |= 1UL;
+
+                m_log.InfoFormat(
+                    "[NOVALYTH SSA C4C]: RegionHandshake advertises server bake agent={0} RegionProtocols=0x{1:X16} CentralBakeVersion={2}",
+                    m_agentId,
+                    regionProtocols,
+                    centralBakeVersion.AsInteger());
+            }
+
+            zc.AddUInt64(regionProtocols);
 
             buf.DataLength = zc.Finish();
             m_udpServer.SendUDPPacket(m_udpClient, buf, ThrottleOutPacketType.Unknown);
@@ -9000,10 +9024,20 @@ namespace OpenSim.Region.ClientStack.LindenUDP
                 return; // silence the warning
 
             RegionHandshakeReplyPacket rsrpkt = (RegionHandshakeReplyPacket)Pack;
+            uint viewerHandshakeFlags = rsrpkt.RegionInfo.Flags;
+
             if(c.m_supportViewerCache)
-                c.m_viewerHandShakeFlags = rsrpkt.RegionInfo.Flags;
+                c.m_viewerHandShakeFlags = viewerHandshakeFlags;
             else
-                c.m_viewerHandShakeFlags = 0;
+                // Preserve the SSA/self-appearance capability bit even when
+                // viewer object-cache probes are disabled.
+                c.m_viewerHandShakeFlags = viewerHandshakeFlags & 4U;
+
+            m_log.InfoFormat(
+                "[NOVALYTH SSA C4C]: RegionHandshakeReply agent={0} flags=0x{1:X8} supports_self_appearance={2}",
+                c.m_agentId,
+                viewerHandshakeFlags,
+                (viewerHandshakeFlags & 4U) != 0);
 
             c.OnRegionHandShakeReply?.Invoke(c);
         }
