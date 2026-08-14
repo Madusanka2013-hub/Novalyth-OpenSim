@@ -1611,3 +1611,39 @@ C4D changes:
 
 Source/build/commit only. No runtime deploy, restart, INI mutation, Appearance
 Core restart, DEV region restart, or LIVE change in this step.
+
+## Appearance C4D2 – canonical full-body authority
+
+Observed after C4D validation:
+- SSA negotiation, nonblocking UpdateAvatarAppearance and stale-generation
+  suppression work.
+- User-visible body swaps could still retain old Shape/Skin/Tattoo appearance.
+- Root cause 1: Region C4A/C4B publication replaced the 11 bake texture UUIDs
+  but explicitly reused `sp.Appearance.VisualParams`, so the previous Shape/body
+  sliders and dimensions remained authoritative.
+- Root cause 2: the Appearance recipe accepted every COF wearable without a
+  strict singleton check for Shape/Skin/Hair/Eyes. A transitional COF could
+  therefore contain more than one bodypart source.
+- Root cause 3: incomplete recipe status was not gated before source auditing;
+  C4D2 prevents an incomplete/canonical-invalid recipe from progressing to bake.
+
+C4D2:
+- Requires exactly one Shape, Skin, Hair and Eyes in the authoritative COF.
+- Allows multi-layer clothing/Tattoo/Alpha/Universal, up to the OpenSim
+  AvatarWearable per-type capacity, and never invents/remembers removed layers.
+- Re-reads authoritative COF after recipe resolution and marks the recipe
+  invalid if ID/version changed during assembly.
+- Treats DEFAULT_AVATAR_TEXTURE as null-equivalent in source graphs.
+- Builds canonical visual-param wire bytes from `VisualParams.Params` using
+  Group-0 ordering and `Utils.FloatToByte`, matching libOpenMetaverse
+  AgentSetAppearance semantics (218 params, or 251 with Physics).
+- Calculates avatar size from the same canonical visual-param values using the
+  libOpenMetaverse AgentSetAppearance height formula.
+- Region validates the manifest payload and publishes canonical Wearables,
+  VisualParams, avatar size and all 11 bake UUIDs from one COF snapshot.
+- Old `sp.Appearance.VisualParams` reuse is removed from SSA publication.
+- Existing last-known-good and stale-generation suppression remain intact.
+- Performance/early cancellation/per-slot reuse remain the next phase.
+
+Source/build/commit only. No runtime deployment, service restart, region restart,
+INI mutation or LIVE `/nvme/opensim` change is performed by this step.

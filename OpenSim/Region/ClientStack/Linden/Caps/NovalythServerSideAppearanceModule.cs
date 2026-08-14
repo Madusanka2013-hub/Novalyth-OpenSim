@@ -555,6 +555,20 @@ namespace Novalyth.Region.Appearance
                 return false;
             }
 
+            if (!TryReadCanonicalAppearancePayload(
+                    manifest,
+                    out byte[] canonicalVisualParams,
+                    out Vector3 canonicalAvatarSize,
+                    out AvatarWearable[] canonicalWearables,
+                    out int canonicalWearableCount,
+                    out string appearancePayloadError))
+            {
+                error =
+                    "canonical_appearance_payload_failed:" +
+                    appearancePayloadError;
+                return false;
+            }
+
             long prewarmStarted = Environment.TickCount64;
             if (!TryPrewarmBakeAssets(
                     sp,
@@ -595,20 +609,214 @@ namespace Novalyth.Region.Appearance
                 return false;
             }
 
-            // Transactional publish: SetAppearance receives the complete texture
-            // entry only after every server bake is stored. Until this exact point
-            // the previous Appearance.Texture stays untouched (last-known-good).
-            factory.SetAppearance(
-                sp,
-                textureEntry,
-                sp.Appearance.VisualParams,
-                null);
+            // NOVALYTH SSA C4D2
+            // Full-body canonical publish. The old implementation replaced only
+            // bake UUIDs while reusing sp.Appearance.VisualParams, which could
+            // leave the previous Shape/body dimensions active. Replace current
+            // Wearables, VisualParams, avatar size and all 11 bakes from the same
+            // authoritative COF snapshot.
+            AvatarWearable[] previousWearables = sp.Appearance.Wearables;
+
+            try
+            {
+                sp.Appearance.Wearables = canonicalWearables;
+
+                factory.SetAppearance(
+                    sp,
+                    textureEntry,
+                    canonicalVisualParams,
+                    null);
+
+                // IAvatarFactoryModule exposes only the 4-argument SetAppearance
+                // contract. Mirror AvatarFactoryModule's concrete size-aware
+                // overload explicitly so appearance and physics bounds use the
+                // same canonical body snapshot.
+                float oldFeetOffset = sp.Appearance.AvatarFeetOffset;
+                Vector3 oldBoxSize = sp.Appearance.AvatarBoxSize;
+
+                sp.Appearance.SetSize(canonicalAvatarSize);
+
+                float newFeetOffset = sp.Appearance.AvatarFeetOffset;
+                Vector3 newBoxSize = sp.Appearance.AvatarBoxSize;
+
+                if (oldFeetOffset != newFeetOffset ||
+                    oldBoxSize != newBoxSize)
+                {
+                    ((ScenePresence)sp).SetSize(
+                        newBoxSize,
+                        newFeetOffset);
+                }
+            }
+            catch (Exception e)
+            {
+                sp.Appearance.Wearables = previousWearables;
+                error =
+                    "canonical_full_body_publish_exception:" +
+                    e.GetType().Name + ":" + e.Message;
+                return false;
+            }
+
+            m_log.InfoFormat(
+                "[NOVALYTH SSA C4D2]: canonical full-body state applied agent={0} generation={1} visual_params={2} wearables={3} size_z={4:F3}",
+                agentID,
+                targetGeneration,
+                canonicalVisualParams.Length,
+                canonicalWearableCount,
+                canonicalAvatarSize.Z);
 
             // OpenSim normally queues an appearance send. SSA should not add the
             // legacy two-second send delay after the server bake is already ready.
             // Send to the owning viewer as well as all observers immediately.
             sp.SendAppearanceToAgentNF(sp);
             sp.SendAppearanceToAllOtherAgents();
+
+            return true;
+        }
+
+        private bool TryReadCanonicalAppearancePayload(
+            OSDMap manifest,
+            out byte[] visualParams,
+            out Vector3 avatarSize,
+            out AvatarWearable[] wearables,
+            out int wearableCount,
+            out string error)
+        {
+            visualParams = Array.Empty<byte>();
+            avatarSize = new Vector3(0.45f, 0.6f, 1.9f);
+            wearables = null;
+            wearableCount = 0;
+            error = string.Empty;
+
+            // NOVALYTH SSA C4D2
+            if (!manifest.TryGetValue(
+                    "appearance_payload_ready",
+                    out OSD ready) ||
+                !ready.AsBoolean())
+            {
+                error = "appearance_payload_not_ready";
+                return false;
+            }
+
+            string encoded =
+                manifest.TryGetValue(
+                    "visual_params_b64",
+                    out OSD visualOSD)
+                    ? visualOSD.AsString()
+                    : string.Empty;
+
+            try
+            {
+                visualParams = Convert.FromBase64String(encoded);
+            }
+            catch
+            {
+                error = "visual_params_invalid_base64";
+                return false;
+            }
+
+            int declaredCount =
+                manifest.TryGetValue(
+                    "visual_param_count",
+                    out OSD countOSD)
+                    ? countOSD.AsInteger()
+                    : 0;
+
+            if ((visualParams.Length != 218 &&
+                 visualParams.Length != 251) ||
+                declaredCount != visualParams.Length)
+            {
+                error =
+                    "visual_params_invalid_count:" +
+                    visualParams.Length + "/" + declaredCount;
+                return false;
+            }
+
+            float sizeX =
+                manifest.TryGetValue("avatar_size_x", out OSD sx)
+                    ? (float)sx.AsReal()
+                    : 0f;
+            float sizeY =
+                manifest.TryGetValue("avatar_size_y", out OSD sy)
+                    ? (float)sy.AsReal()
+                    : 0f;
+            float sizeZ =
+                manifest.TryGetValue("avatar_size_z", out OSD sz)
+                    ? (float)sz.AsReal()
+                    : 0f;
+
+            if (sizeX < 0.1f || sizeX > 2f ||
+                sizeY < 0.1f || sizeY > 2f ||
+                sizeZ < 0.5f || sizeZ > 4f)
+            {
+                error = "invalid_avatar_size";
+                return false;
+            }
+
+            avatarSize = new Vector3(sizeX, sizeY, sizeZ);
+
+            if (!manifest.TryGetValue("wearables", out OSD wearablesOSD) ||
+                wearablesOSD is not OSDArray wearableArray)
+            {
+                error = "manifest_wearables_missing";
+                return false;
+            }
+
+            wearables = new AvatarWearable[AvatarWearable.MAX_WEARABLES];
+            int[] counts = new int[AvatarWearable.MAX_WEARABLES];
+
+            for (int i = 0; i < wearables.Length; i++)
+                wearables[i] = new AvatarWearable();
+
+            foreach (OSD entry in wearableArray)
+            {
+                if (entry is not OSDMap wearable)
+                    continue;
+
+                int wearableType = wearable["wearable_type"].AsInteger();
+                if (wearableType < 0 ||
+                    wearableType >= AvatarWearable.MAX_WEARABLES)
+                {
+                    error = "invalid_wearable_type:" + wearableType;
+                    return false;
+                }
+
+                if (!UUID.TryParse(
+                        wearable["inventory_item_id"].AsString(),
+                        out UUID itemID) ||
+                    itemID.IsZero() ||
+                    !UUID.TryParse(
+                        wearable["asset_id"].AsString(),
+                        out UUID assetID) ||
+                    assetID.IsZero())
+                {
+                    error = "invalid_wearable_identity";
+                    return false;
+                }
+
+                counts[wearableType]++;
+                if (counts[wearableType] > 5)
+                {
+                    error =
+                        "wearable_type_overflow:" +
+                        wearableType + ":" + counts[wearableType];
+                    return false;
+                }
+
+                wearables[wearableType].Add(itemID, assetID);
+                wearableCount++;
+            }
+
+            // Shape, Skin, Hair, Eyes are strict singletons.
+            for (int type = 0; type <= 3; type++)
+            {
+                if (counts[type] != 1)
+                {
+                    error =
+                        "singleton_bodypart_invalid:" +
+                        type + ":" + counts[type];
+                    return false;
+                }
+            }
 
             return true;
         }

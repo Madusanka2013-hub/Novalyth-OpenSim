@@ -120,6 +120,15 @@ namespace Novalyth.Server.Appearance
         private const int WT_PHYSICS = 15;
         private const int WT_UNIVERSAL = 16;
 
+        // NOVALYTH APPEARANCE C4D2
+        // SL bodyparts are singleton authorities. Multiple clothing/tattoo/
+        // alpha/universal layers are valid, but Shape/Skin/Hair/Eyes must each
+        // resolve to exactly one item in the authoritative final COF.
+        private static readonly int[] s_singletonBodypartWearableTypes =
+        {
+            WT_SHAPE, WT_SKIN, WT_HAIR, WT_EYES
+        };
+
         private static readonly BakeDefinition[] s_bakeDefinitions =
         {
             new(0, "head", new[]
@@ -716,6 +725,26 @@ namespace Novalyth.Server.Appearance
                         return;
                     }
 
+                    if (manifest["status"].AsString() != "recipe_source_ready")
+                    {
+                        SaveManifest(agentID, manifest);
+
+                        OSDMap fail = new();
+                        fail["success"] = false;
+                        fail["error"] = "recipe_not_ready";
+                        fail["manifest_status"] = manifest["status"].AsString();
+                        fail["cof_stable"] =
+                            manifest.TryGetValue("cof_stable", out OSD stable) &&
+                            stable.AsBoolean();
+                        fail["bodypart_singletons_valid"] =
+                            manifest.TryGetValue(
+                                "bodypart_singletons_valid",
+                                out OSD singletons) &&
+                            singletons.AsBoolean();
+                        WriteMap(response, HttpStatusCode.OK, fail);
+                        return;
+                    }
+
                     AuditSourceTextures(manifest);
 
                     if (manifest["status"].AsString() != "source_decode_ready")
@@ -1075,7 +1104,10 @@ namespace Novalyth.Server.Appearance
                 }
 
                 foreach (KeyValuePair<int, float> parameter in wearableAsset.Params)
-                    visualParams[parameter.Key] = parameter.Value;
+                {
+                    if (!visualParams.ContainsKey(parameter.Key))
+                        visualParams[parameter.Key] = parameter.Value;
+                }
 
                 AppearanceManager.TextureData[] temp =
                     new AppearanceManager.TextureData[
@@ -2902,6 +2934,184 @@ namespace Novalyth.Server.Appearance
             WriteMap(response, HttpStatusCode.OK, accepted);
         }
 
+        private static List<string> ValidateCanonicalWearables(
+            List<RecipeItem> wearables)
+        {
+            List<string> errors = new();
+
+            foreach (int wearableType in s_singletonBodypartWearableTypes)
+            {
+                int count = wearables.Count(x => x.WearableType == wearableType);
+                if (count != 1)
+                {
+                    errors.Add(
+                        "singleton_" + WearableTypeLabel(wearableType) +
+                        "_count=" + count);
+                }
+            }
+
+            foreach (IGrouping<int, RecipeItem> group in
+                     wearables.GroupBy(x => x.WearableType))
+            {
+                // OpenSim AvatarWearable stores at most five entries per type.
+                // Reject rather than silently truncating active appearance state.
+                if (group.Count() > 5)
+                {
+                    errors.Add(
+                        "wearable_type_" + group.Key +
+                        "_count_exceeds_5=" + group.Count());
+                }
+            }
+
+            return errors;
+        }
+
+        private static string WearableTypeLabel(int wearableType)
+        {
+            return wearableType switch
+            {
+                WT_SHAPE => "shape",
+                WT_SKIN => "skin",
+                WT_HAIR => "hair",
+                WT_EYES => "eyes",
+                _ => wearableType.ToString(CultureInfo.InvariantCulture)
+            };
+        }
+
+        private static bool TryBuildCanonicalAppearancePayload(
+            List<RecipeItem> wearables,
+            out byte[] wireVisualParams,
+            out Vector3 avatarSize,
+            out string error)
+        {
+            wireVisualParams = Array.Empty<byte>();
+            avatarSize = new Vector3(0.45f, 0.6f, 1.9f);
+            error = string.Empty;
+
+            Dictionary<int, float> values = new();
+
+            // Same precedence model used by libOpenMetaverse: first currently
+            // worn wearable carrying a parameter wins. RecipeItem sorting makes
+            // Shape/Skin/Hair/Eyes deterministic before clothing layers.
+            foreach (RecipeItem item in wearables)
+            {
+                if (item.ParsedWearable == null)
+                    continue;
+
+                foreach (WearableParameter parameter in
+                         item.ParsedWearable.Parameters.OrderBy(x => x.ID))
+                {
+                    if (!values.ContainsKey(parameter.ID))
+                        values[parameter.ID] = parameter.Weight;
+                }
+            }
+
+            bool wearingPhysics =
+                wearables.Any(x => x.WearableType == WT_PHYSICS);
+
+            int requiredCount = wearingPhysics ? 251 : 218;
+            wireVisualParams = new byte[requiredCount];
+
+            float height = 0f;
+            float heelHeight = 0f;
+            float platformHeight = 0f;
+            float headSize = 0.5f;
+            float legLength = 0f;
+            float neckLength = 0f;
+            float hipLength = 0f;
+
+            int wireIndex = 0;
+
+            foreach (KeyValuePair<int, VisualParam> kvp in VisualParams.Params)
+            {
+                VisualParam vp = kvp.Value;
+
+                float value =
+                    values.TryGetValue(vp.ParamID, out float found)
+                        ? found
+                        : vp.DefaultValue;
+
+                if (vp.Group == 0)
+                {
+                    if (wireIndex >= requiredCount)
+                        break;
+
+                    wireVisualParams[wireIndex++] =
+                        Utils.FloatToByte(
+                            value,
+                            vp.MinValue,
+                            vp.MaxValue);
+                }
+
+                switch (vp.ParamID)
+                {
+                    case 33:
+                        height = value;
+                        break;
+                    case 198:
+                        heelHeight = value;
+                        break;
+                    case 503:
+                        platformHeight = value;
+                        break;
+                    case 682:
+                        headSize = value;
+                        break;
+                    case 692:
+                        legLength = value;
+                        break;
+                    case 756:
+                        neckLength = value;
+                        break;
+                    case 842:
+                        hipLength = value;
+                        break;
+                }
+
+                if (wireIndex == requiredCount)
+                    break;
+            }
+
+            if (wireIndex != requiredCount)
+            {
+                error =
+                    "visual_param_count_mismatch:" +
+                    wireIndex + "/" + requiredCount;
+                wireVisualParams = Array.Empty<byte>();
+                return false;
+            }
+
+            // libOpenMetaverse AgentSetAppearance size calculation.
+            double agentHeight =
+                1.706 +
+                (legLength * .1918) +
+                (hipLength * .0375) +
+                (height * .12022) +
+                (headSize * .01117) +
+                (neckLength * .038) +
+                (heelHeight * .08) +
+                (platformHeight * .07);
+
+            if (double.IsNaN(agentHeight) ||
+                double.IsInfinity(agentHeight) ||
+                agentHeight < 0.5 ||
+                agentHeight > 4.0)
+            {
+                error = "invalid_avatar_height:" +
+                    agentHeight.ToString("R", CultureInfo.InvariantCulture);
+                wireVisualParams = Array.Empty<byte>();
+                return false;
+            }
+
+            avatarSize =
+                new Vector3(
+                    0.45f,
+                    0.6f,
+                    (float)agentHeight);
+
+            return true;
+        }
+
         private bool TryBuildAndPersistRecipe(
             UUID agentID,
             out OSDMap manifest,
@@ -3045,6 +3255,45 @@ namespace Novalyth.Server.Appearance
             wearables.Sort(RecipeItem.Compare);
             attachments.Sort(RecipeItem.Compare);
 
+            List<string> bodypartCardinalityErrors =
+                ValidateCanonicalWearables(wearables);
+
+            // Re-read COF after resolving every link and wearable asset. If its
+            // folder version changed while the recipe was being assembled, this
+            // snapshot is transitional and must never be baked/published.
+            InventoryFolderBase cofAfter = GetAuthoritativeCOF(agentID);
+            bool cofStable =
+                cofAfter != null &&
+                cofAfter.ID == cof.ID &&
+                cofAfter.Version == cof.Version;
+
+            string cofStabilityError = cofStable
+                ? string.Empty
+                : "cof_changed_during_recipe";
+
+            bool appearancePayloadReady = false;
+            byte[] canonicalVisualParams = Array.Empty<byte>();
+            Vector3 canonicalAvatarSize = new Vector3(0.45f, 0.6f, 1.9f);
+            string appearancePayloadError = string.Empty;
+
+            if (bodypartCardinalityErrors.Count == 0 &&
+                missingAssets.Count == 0 &&
+                wearableParseErrors.Count == 0 &&
+                wearableTypeMismatches.Count == 0 &&
+                cofStable)
+            {
+                appearancePayloadReady =
+                    TryBuildCanonicalAppearancePayload(
+                        wearables,
+                        out canonicalVisualParams,
+                        out canonicalAvatarSize,
+                        out appearancePayloadError);
+            }
+            else
+            {
+                appearancePayloadError = "canonical_prerequisites_not_ready";
+            }
+
             List<SourceTextureLayer> sourceLayers = BuildSourceTextureGraph(wearables);
             List<string> missingSourceAssets = ProbeSourceAssetExistence(sourceLayers);
 
@@ -3069,6 +3318,8 @@ namespace Novalyth.Server.Appearance
             OSDArray parseErrorArray = ToStringArray(wearableParseErrors);
             OSDArray typeMismatchArray = ToStringArray(wearableTypeMismatches);
             OSDArray missingSourceArray = ToStringArray(missingSourceAssets);
+            OSDArray bodypartCardinalityArray =
+                ToStringArray(bodypartCardinalityErrors);
 
             OSDArray sourceTextureArray = new();
             foreach (SourceTextureLayer layer in sourceLayers)
@@ -3133,6 +3384,25 @@ namespace Novalyth.Server.Appearance
             manifest["missing_assets"] = missingArray;
             manifest["wearable_parse_errors"] = parseErrorArray;
             manifest["wearable_type_mismatches"] = typeMismatchArray;
+            manifest["bodypart_cardinality_errors"] = bodypartCardinalityArray;
+            manifest["bodypart_singletons_valid"] =
+                bodypartCardinalityErrors.Count == 0;
+            manifest["cof_stable"] = cofStable;
+            manifest["cof_stability_error"] = cofStabilityError;
+            manifest["appearance_payload_ready"] = appearancePayloadReady;
+            manifest["appearance_payload_error"] =
+                appearancePayloadError ?? string.Empty;
+            manifest["visual_params_b64"] =
+                appearancePayloadReady
+                    ? Convert.ToBase64String(canonicalVisualParams)
+                    : string.Empty;
+            manifest["visual_param_count"] =
+                appearancePayloadReady
+                    ? canonicalVisualParams.Length
+                    : 0;
+            manifest["avatar_size_x"] = canonicalAvatarSize.X;
+            manifest["avatar_size_y"] = canonicalAvatarSize.Y;
+            manifest["avatar_size_z"] = canonicalAvatarSize.Z;
             manifest["source_textures"] = sourceTextureArray;
             manifest["missing_source_assets"] = missingSourceArray;
             manifest["source_texture_count"] = sourceLayers.Count;
@@ -3148,7 +3418,10 @@ namespace Novalyth.Server.Appearance
                 missingAssets.Count > 0 ||
                 wearableParseErrors.Count > 0 ||
                 wearableTypeMismatches.Count > 0 ||
-                missingSourceAssets.Count > 0)
+                missingSourceAssets.Count > 0 ||
+                bodypartCardinalityErrors.Count > 0 ||
+                !cofStable ||
+                !appearancePayloadReady)
             {
                 manifest["status"] = "recipe_incomplete";
             }
@@ -3236,8 +3509,11 @@ namespace Novalyth.Server.Appearance
                         continue;
                     }
 
-                    if (texture.TextureID.IsZero())
+                    if (texture.TextureID.IsZero() ||
+                        texture.TextureID == AppearanceManager.DEFAULT_AVATAR_TEXTURE)
+                    {
                         continue;
+                    }
 
                     result.Add(new SourceTextureLayer
                     {
