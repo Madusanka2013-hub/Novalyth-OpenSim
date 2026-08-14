@@ -1002,3 +1002,47 @@ Next:
 
 - bounded remote Inventory request concurrency and fairness;
 - tune workers only after batching/cache/coalescing have removed duplicate work.
+
+## R2 Inventory Performance – Bounded Concurrency + Fairness
+
+Status: **DEV RUNTIME VALIDATED**
+
+Date: 2026-08-14
+
+Implementation:
+
+- remote Inventory HTTP calls are bounded to `32` concurrent
+  requests per process/endpoint gate;
+- connectors targeting the same endpoint and using the same gate settings share
+  one gate inside a process;
+- no per-user hard cap and no request rejection path exists;
+- when all active slots are occupied, requests wait instead of being rejected;
+- queued requests are grouped by principal and dispatched round-robin;
+- requests without a resolvable principal use a system lane;
+- new arrivals do not jump ahead of already queued work;
+- folder-cache hits and coalesced reads bypass remote HTTP and therefore consume
+  no remote gate slot;
+- native Inventory Core DB batching remains unchanged.
+
+Configuration:
+
+- `RemoteMaxConcurrentRequests = 32`;
+- `RemoteFairQueue = true`;
+- configured for Robust `InventoryService`, Robust `HGInventoryService`, and
+  Region `InventoryService`.
+
+Validation:
+
+- full solution build passed before runtime deployment;
+- bounded gate and round-robin dispatcher are present in built Connectors DLL;
+- DEV Robust and DEV Region loaded the new gate configuration;
+- functional parallel GETROOTFOLDER probe returned all HTTP 200 responses;
+- runtime fair-queue observation: `NOT_OBSERVED_NONBLOCKING`;
+- Inventory Core 8120 and Asset Core 8110 were not restarted;
+- LIVE `/nvme/opensim` remained untouched.
+
+Next:
+
+- inspect Inventory Core incoming execution model before changing worker counts;
+- add queue/latency telemetry only where it can guide tuning without changing
+  request semantics.

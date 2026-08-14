@@ -83,6 +83,17 @@ namespace OpenSim.Services.Connectors
         private int m_FolderCacheHitLogOnce;
         private int m_FolderCoalescedLogOnce;
 
+        // NOVALYTH R2: bounded remote request concurrency without rejection.
+        // Waiting requests are dispatched round-robin by principal lane.
+        private static readonly ConcurrentDictionary<string, InventoryRemoteRequestGate>
+            m_RemoteRequestGates = new();
+
+        private InventoryRemoteRequestGate m_RemoteRequestGate;
+        private int m_RemoteMaxConcurrentRequests = 32;
+        private bool m_RemoteFairQueue = true;
+        private long m_RemoteQueueWaits;
+        private int m_RemoteQueueWaitLogOnce;
+
         public XInventoryServicesConnector()
         {
         }
@@ -140,6 +151,19 @@ namespace OpenSim.Services.Connectors
                 "[NOVALYTH INVENTORY REMOTE]: folder-cache ttl={0:0.000}s coalescing={1} endpoint={2}",
                 m_FolderContentCacheSeconds,
                 m_FolderContentCoalescing,
+                m_InventoryURL);
+
+            m_RemoteMaxConcurrentRequests =
+                Math.Clamp(config.GetInt("RemoteMaxConcurrentRequests", 32), 1, 256);
+            m_RemoteFairQueue =
+                config.GetBoolean("RemoteFairQueue", true);
+
+            m_RemoteRequestGate = GetOrCreateRemoteRequestGate();
+
+            m_log.InfoFormat(
+                "[NOVALYTH INVENTORY REMOTE]: concurrency max={0} fair-queue={1} rejection=none endpoint={2}",
+                m_RemoteMaxConcurrentRequests,
+                m_RemoteFairQueue,
                 m_InventoryURL);
 
             StatsManager.RegisterStat(
@@ -960,11 +984,211 @@ namespace OpenSim.Services.Connectors
 
         // Helpers
         //
+        private InventoryRemoteRequestGate GetOrCreateRemoteRequestGate()
+        {
+            string gateKey =
+                $"{m_InventoryURL}|{m_RemoteMaxConcurrentRequests}|{m_RemoteFairQueue}";
+
+            return m_RemoteRequestGates.GetOrAdd(
+                gateKey,
+                _ => new InventoryRemoteRequestGate(
+                    m_RemoteMaxConcurrentRequests,
+                    m_RemoteFairQueue));
+        }
+
+        private IDisposable EnterRemoteRequestGate(string principalLane)
+        {
+            m_RemoteRequestGate ??= GetOrCreateRemoteRequestGate();
+
+            IDisposable lease = m_RemoteRequestGate.Enter(
+                principalLane,
+                out bool queued,
+                out int queueDepth);
+
+            if (queued)
+            {
+                Interlocked.Increment(ref m_RemoteQueueWaits);
+
+                if (Interlocked.Exchange(ref m_RemoteQueueWaitLogOnce, 1) == 0)
+                {
+                    m_log.InfoFormat(
+                        "[NOVALYTH INVENTORY REMOTE]: fair-queue WAIT; depth={0} max-active={1} lane={2}",
+                        queueDepth,
+                        m_RemoteMaxConcurrentRequests,
+                        principalLane);
+                }
+            }
+
+            return lease;
+        }
+
+        private static string GetPrincipalLane(
+            Dictionary<string, object> sendData)
+        {
+            if (TryGetPrincipal(sendData, out UUID principalID))
+                return principalID.ToString();
+
+            return "__system__";
+        }
+
+        private static string GetPrincipalLane(string query)
+        {
+            if (string.IsNullOrEmpty(query))
+                return "__system__";
+
+            var parsed = HttpUtility.ParseQueryString(query);
+
+            string principal =
+                parsed["PRINCIPAL"]
+                ?? parsed["Owner"]
+                ?? parsed["OWNER"];
+
+            return UUID.TryParse(principal, out UUID principalID)
+                ? principalID.ToString()
+                : "__system__";
+        }
+
+        private sealed class InventoryRemoteRequestGate
+        {
+            private readonly object m_Sync = new();
+            private readonly int m_MaxActive;
+            private readonly bool m_Fair;
+
+            private readonly Dictionary<string, Queue<GateWaiter>> m_Lanes = new();
+            private readonly Queue<string> m_RoundRobin = new();
+
+            private int m_Active;
+            private int m_Waiting;
+
+            public InventoryRemoteRequestGate(int maxActive, bool fair)
+            {
+                m_MaxActive = Math.Max(1, maxActive);
+                m_Fair = fair;
+            }
+
+            public IDisposable Enter(
+                string principalLane,
+                out bool queued,
+                out int queueDepth)
+            {
+                principalLane =
+                    string.IsNullOrEmpty(principalLane)
+                        ? "__system__"
+                        : principalLane;
+
+                GateWaiter waiter = null;
+
+                lock (m_Sync)
+                {
+                    // Do not let a new arrival jump in front of already queued
+                    // work even if a slot appears between dispatch operations.
+                    if (m_Active < m_MaxActive && m_Waiting == 0)
+                    {
+                        m_Active++;
+                        queued = false;
+                        queueDepth = 0;
+                        return new GateLease(this);
+                    }
+
+                    string lane = m_Fair ? principalLane : "__fifo__";
+
+                    if (!m_Lanes.TryGetValue(lane, out Queue<GateWaiter> laneQueue))
+                    {
+                        laneQueue = new Queue<GateWaiter>();
+                        m_Lanes[lane] = laneQueue;
+                        m_RoundRobin.Enqueue(lane);
+                    }
+
+                    waiter = new GateWaiter();
+                    laneQueue.Enqueue(waiter);
+                    m_Waiting++;
+
+                    queued = true;
+                    queueDepth = m_Waiting;
+                }
+
+                waiter.Signal.Wait();
+                waiter.Signal.Dispose();
+
+                return new GateLease(this);
+            }
+
+            private void Exit()
+            {
+                List<GateWaiter> wake = null;
+
+                lock (m_Sync)
+                {
+                    if (m_Active > 0)
+                        m_Active--;
+
+                    while (m_Active < m_MaxActive && m_RoundRobin.Count > 0)
+                    {
+                        string lane = m_RoundRobin.Dequeue();
+
+                        if (!m_Lanes.TryGetValue(
+                                lane, out Queue<GateWaiter> laneQueue)
+                            || laneQueue.Count == 0)
+                        {
+                            m_Lanes.Remove(lane);
+                            continue;
+                        }
+
+                        GateWaiter waiter = laneQueue.Dequeue();
+                        m_Waiting--;
+                        m_Active++;
+
+                        if (laneQueue.Count > 0)
+                            m_RoundRobin.Enqueue(lane);
+                        else
+                            m_Lanes.Remove(lane);
+
+                        wake ??= [];
+                        wake.Add(waiter);
+                    }
+                }
+
+                if (wake == null)
+                    return;
+
+                foreach (GateWaiter waiter in wake)
+                    waiter.Signal.Set();
+            }
+
+            private sealed class GateWaiter
+            {
+                public readonly ManualResetEventSlim Signal = new(false);
+            }
+
+            private sealed class GateLease : IDisposable
+            {
+                private InventoryRemoteRequestGate m_Owner;
+
+                public GateLease(InventoryRemoteRequestGate owner)
+                {
+                    m_Owner = owner;
+                }
+
+                public void Dispose()
+                {
+                    InventoryRemoteRequestGate owner =
+                        Interlocked.Exchange(ref m_Owner, null);
+
+                    owner?.Exit();
+                }
+            }
+        }
+
         private Dictionary<string, object> MakeRequest(Dictionary<string, object> sendData)
         {
-            RequestsMade++;
-            Dictionary<string, object> replyData =
-                MakePostDicRequest(ServerUtils.BuildQueryString(sendData));
+            Dictionary<string, object> replyData;
+
+            using (EnterRemoteRequestGate(GetPrincipalLane(sendData)))
+            {
+                RequestsMade++;
+                replyData =
+                    MakePostDicRequest(ServerUtils.BuildQueryString(sendData));
+            }
 
             MaybeInvalidateFolderContentCache(sendData, replyData);
             return replyData;
@@ -972,8 +1196,13 @@ namespace OpenSim.Services.Connectors
 
         private Dictionary<string, object> MakeRequest(string query)
         {
-            RequestsMade++;
-            Dictionary<string, object> replyData = MakePostDicRequest(query);
+            Dictionary<string, object> replyData;
+
+            using (EnterRemoteRequestGate(GetPrincipalLane(query)))
+            {
+                RequestsMade++;
+                replyData = MakePostDicRequest(query);
+            }
 
             MaybeInvalidateFolderContentCache(query, replyData);
             return replyData;
