@@ -37,6 +37,7 @@ using Nini.Config;
 using OpenMetaverse;
 using OpenMetaverse.StructuredData;
 using OpenSim.Framework;
+using OpenSim.Framework.Monitoring;
 using OpenSim.Framework.Servers;
 using OpenSim.Framework.Servers.HttpServer;
 using OpenSim.Services.Interfaces;
@@ -125,6 +126,9 @@ namespace OpenSim.Capabilities.Handlers
             if(!UUID.TryParse(assetStr, out UUID assetID))
                 return;
 
+            long fetchStartedAtMs = Environment.TickCount64;
+            NovalythAssetPipelineMetrics.BackendStarted();
+
             TaskCompletionSource<AssetBase> completion =
                 new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -138,6 +142,8 @@ namespace OpenSim.Capabilities.Handlers
                 m_log.ErrorFormat(
                     "[GETASSET]: asset service threw while requesting {0}: {1}",
                     assetID, e);
+                NovalythAssetPipelineMetrics.BackendFinished(
+                    Environment.TickCount64 - fetchStartedAtMs, false, true, false);
                 response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
                 response.KeepAlive = false;
                 return;
@@ -148,6 +154,8 @@ namespace OpenSim.Capabilities.Handlers
                 m_log.WarnFormat(
                     "[GETASSET]: timed out after {0} ms requesting asset {1}",
                     m_assetFetchTimeoutMs, assetID);
+                NovalythAssetPipelineMetrics.BackendFinished(
+                    Environment.TickCount64 - fetchStartedAtMs, true, false, false);
                 response.StatusCode = (int)HttpStatusCode.GatewayTimeout;
                 response.KeepAlive = false;
                 return;
@@ -157,10 +165,15 @@ namespace OpenSim.Capabilities.Handlers
 
             if (asset == null)
             {
+                NovalythAssetPipelineMetrics.BackendFinished(
+                    Environment.TickCount64 - fetchStartedAtMs, false, false, true);
                 // m_log.Warn("[GETASSET]: not found: " + query + " " + assetStr);
                 response.StatusCode = (int)HttpStatusCode.NotFound;
                 return;
             }
+
+            NovalythAssetPipelineMetrics.BackendFinished(
+                Environment.TickCount64 - fetchStartedAtMs, false, false, false);
 
             int len = asset.Data.Length;
 

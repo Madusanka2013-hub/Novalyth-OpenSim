@@ -338,3 +338,27 @@ Planned coarse-grained services after R1 baseline stability:
 6. Regions remain independent simulator processes.
 
 Initial split stays on the same physical server over loopback/private ports so process isolation is gained without adding unnecessary network latency.
+
+### R1 Stage 2 – Asset Pipeline Instrumentation
+
+Implemented in source:
+
+- Added thread-safe `NovalythAssetPipelineMetrics`.
+- Added region console command `show asset pipeline`.
+- Added region console command `reset asset pipeline`.
+- Measures CAPS requests, current/peak pending queue and queue-wait p50/p95/p99 buckets.
+- Measures end-to-end CAPS backend fetch in-flight/peak, p50/p95/p99, timeouts, errors and not-found.
+- Measures RegionAssetConnector memory hits and duplicate-request coalescing.
+- Measures local and remote/HG pending/peak, in-flight/peak, completed, errors, not-found and fetch p50/p95/p99.
+- Worker defaults remain CAPS=3, local=2, remote=2.
+- No concurrency tuning or backpressure change is part of Stage 2.
+
+Measurement procedure after DEV deployment:
+
+1. `reset asset pipeline`
+2. Perform a controlled Firestorm cold-load test.
+3. Let scene/avatar rez settle.
+4. `show asset pipeline`
+5. Record results.
+6. Repeat as warm-load test.
+7. Increase concurrency only if queue wait/peak proves it is the bottleneck.

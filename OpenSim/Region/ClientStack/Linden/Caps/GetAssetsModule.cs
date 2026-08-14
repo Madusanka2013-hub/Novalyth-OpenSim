@@ -33,6 +33,7 @@ using System.Reflection;
 using System.Threading;
 using Mono.Addins;
 using OpenSim.Framework.Monitoring;
+using OpenSim.Framework.Console;
 using log4net;
 using Nini.Config;
 using OpenMetaverse;
@@ -68,6 +69,7 @@ namespace OpenSim.Region.ClientStack.Linden
             public PollServiceAssetEventArgs thepoll;
             public UUID reqID;
             public OSHttpRequest request;
+            public long enqueuedAtMs;
         }
 
         public class APollResponse
@@ -82,6 +84,7 @@ namespace OpenSim.Region.ClientStack.Linden
         private static ObjectJobEngine m_workerpool = null;
         private static int m_NumberScenes = 0;
         private static object m_loadLock = new object();
+        private static int m_commandsRegistered = 0;
         protected IUserManagement m_UserManagement = null;
 
         #region Region Module interfaceBase Members
@@ -167,9 +170,25 @@ namespace OpenSim.Region.ClientStack.Linden
                 {
                     m_workerpool = new ObjectJobEngine(
                         DoAssetRequests, "GetCapsAssetWorker", 1000, m_capsAssetWorkers);
+                    NovalythAssetPipelineMetrics.SetCapsConfig(
+                        m_capsAssetWorkers, m_assetFetchTimeoutMs);
                     m_log.InfoFormat(
                         "[GETASSETS]: CAPS asset workers={0}, fetch timeout={1} ms",
                         m_capsAssetWorkers, m_assetFetchTimeoutMs);
+                }
+
+                if (Interlocked.CompareExchange(ref m_commandsRegistered, 1, 0) == 0)
+                {
+                    MainConsole.Instance.Commands.AddCommand(
+                        "Novalyth", false,
+                        "show asset pipeline", "show asset pipeline",
+                        "Show Novalyth asset pipeline metrics",
+                        HandleShowAssetPipeline);
+                    MainConsole.Instance.Commands.AddCommand(
+                        "Novalyth", false,
+                        "reset asset pipeline", "reset asset pipeline",
+                        "Reset Novalyth asset pipeline metrics",
+                        HandleResetAssetPipeline);
                 }
             }
         }
@@ -193,7 +212,22 @@ namespace OpenSim.Region.ClientStack.Linden
                 return;
             APollRequest poolreq = o as APollRequest;
             if (poolreq != null && !poolreq.reqID.IsZero())
+            {
+                NovalythAssetPipelineMetrics.CapsDequeued(
+                    Environment.TickCount64 - poolreq.enqueuedAtMs);
                 poolreq.thepoll.Process(poolreq);
+            }
+        }
+
+        private static void HandleShowAssetPipeline(string module, string[] args)
+        {
+            MainConsole.Instance.Output(NovalythAssetPipelineMetrics.GetReport());
+        }
+
+        private static void HandleResetAssetPipeline(string module, string[] args)
+        {
+            NovalythAssetPipelineMetrics.Reset();
+            MainConsole.Instance.Output("[NOVALYTH] Asset pipeline metrics reset.");
         }
 
         private class PollServiceAssetEventArgs : PollServiceEventArgs
@@ -255,9 +289,11 @@ namespace OpenSim.Region.ClientStack.Linden
                     {
                         thepoll = this,
                         reqID = requestID,
-                        request = request
+                        request = request,
+                        enqueuedAtMs = Environment.TickCount64
                     };
 
+                    NovalythAssetPipelineMetrics.CapsEnqueued();
                     m_workerpool.Enqueue(reqinfo);
                     return null;
                 };

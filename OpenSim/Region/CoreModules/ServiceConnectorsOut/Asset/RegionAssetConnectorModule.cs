@@ -147,6 +147,8 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
                     m_remoteRequestsQueue = new ObjectJobEngine(
                         AssetRequestProcessor, "GetRemoteAssetsWorkers", 2000, m_remoteAssetWorkers);
                     m_Enabled = true;
+                    NovalythAssetPipelineMetrics.SetRegionConfig(
+                        m_localAssetWorkers, m_remoteAssetWorkers);
                     m_log.InfoFormat(
                         "[REGIONASSETCONNECTOR]: enabled local workers={0}, remote workers={1}",
                         m_localAssetWorkers, m_remoteAssetWorkers);
@@ -378,6 +380,7 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
                     if (m_AssetHandlers.TryGetValue(id, out handlers))
                     {
                         // Someone else is already loading this asset. It will notify our handler when done.
+                        NovalythAssetPipelineMetrics.Coalesced();
                         handlers.Add(handlerEx);
                         return true;
                     }
@@ -386,6 +389,7 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
                     handlers.Add(handlerEx);
 
                     m_AssetHandlers.Add(id, handlers);
+                    NovalythAssetPipelineMetrics.RegionEnqueued(false);
                     m_localRequestsQueue.Enqueue(id);
                 }
             }
@@ -393,6 +397,8 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
             {
                 if (asset != null && (asset.Data == null || asset.Data.Length == 0))
                     asset = null;
+                if (asset != null)
+                    NovalythAssetPipelineMetrics.MemoryHit();
                 callBack(id, sender, asset);
             }
             return true;
@@ -433,6 +439,7 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
                     if (m_AssetHandlers.TryGetValue(id, out handlers))
                     {
                         // Someone else is already loading this asset. It will notify our handler when done.
+                        NovalythAssetPipelineMetrics.Coalesced();
                         handlers.Add(handlerEx);
                         return;
                     }
@@ -442,7 +449,10 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
 
                     m_AssetHandlers.Add(id, handlers);
                     if(string.IsNullOrEmpty(ForeignAssetService))
+                    {
+                        NovalythAssetPipelineMetrics.RegionEnqueued(false);
                         m_localRequestsQueue.Enqueue(id);
+                    }
                     else
                     {
                         ForeignAssetServiceGetData fasgd = new ForeignAssetServiceGetData
@@ -451,6 +461,7 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
                             ForeignAssetService = ForeignAssetService,
                             StoreOnLocalGrid = StoreOnLocalGrid
                         };
+                        NovalythAssetPipelineMetrics.RegionEnqueued(true);
                         m_remoteRequestsQueue.Enqueue(fasgd);
                     }
                 }
@@ -459,6 +470,8 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
             {
                 if (asset != null && (asset.Data == null || asset.Data.Length == 0))
                     asset = null;
+                if (asset != null)
+                    NovalythAssetPipelineMetrics.MemoryHit();
                 callBack(asset);
             }
         }
@@ -470,6 +483,11 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
 
             AssetBase asset = null;
             string id = null;
+            bool remote = o is ForeignAssetServiceGetData;
+            bool error = false;
+            long startedAtMs = Environment.TickCount64;
+
+            NovalythAssetPipelineMetrics.RegionDequeued(remote);
 
             try
             {
@@ -486,9 +504,16 @@ namespace OpenSim.Region.CoreModules.ServiceConnectorsOut.Asset
             }
             catch (Exception e)
             {
+                error = true;
                 m_log.ErrorFormat(
                     "[REGIONASSETCONNECTOR]: asset request failed for {0}: {1}",
                     id ?? "<unknown>", e);
+            }
+            finally
+            {
+                NovalythAssetPipelineMetrics.RegionFinished(
+                    remote, Environment.TickCount64 - startedAtMs,
+                    error, !error && asset == null);
             }
 
             if (string.IsNullOrEmpty(id))
