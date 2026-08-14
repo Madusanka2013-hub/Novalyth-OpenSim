@@ -1382,3 +1382,22 @@ Viewer validation:
 - Phase C3 will validate real Firestorm SSA end-to-end and only then advertise RegionProtocols bit 0 / CentralBakeVersion.
 - Only Appearance Core and DEV Region are restarted for C1.
 - DEV Robust, Asset Core, Inventory Core and LIVE remain untouched.
+
+## Appearance Core Phase C2A – wearable parser + source J2K audit (20260814-130800)
+
+- Base commit: `11f2b757d8909449ee2bcc13d3f1a9ca1b0bc34b`.
+- C2 is deliberately split so Novalyth does not claim a fake SL compositor.
+- Appearance Core parses wearable asset payloads: wearable type, visual parameters and texture entries.
+- Inventory wearable type and asset-declared wearable type are both recorded; mismatches are explicit.
+- Current SL local texture indices are mapped to the 11 `sl-current-11-v1` bake slots.
+- Deterministic recipe format advances to `novalyth-ssa-recipe-v2` and includes parsed wearable payload hashes.
+- Manifests record parsed wearable parameters/textures, source texture references, parse errors, missing wearable assets and missing source assets.
+- Internal `GET /novalythappearance/sourceaudit/<agent>` fetches unique source textures from Asset Core :8110 and verifies JPEG2000 decoding.
+- C2A source reference sequence is deterministic audit order only; it is **not** claimed as final SL compositor layer order.
+- Correct tint/color, alpha, masks and avatar layer semantics remain C2B work.
+- No bake J2K output is generated or stored in C2A.
+- `CentralBakeVersion` / `AdvertiseCentralBake` remains disabled.
+- Only Appearance Core is restarted for C2A.
+- DEV Region, DEV Robust, Asset Core, Inventory Core and LIVE remain untouched.
+- C2B: SL/avatar_lad-compatible layer semantics + real compositor + J2K encode/store.
+- C3: real Firestorm SSA validation and only then CentralBakeVersion advertisement.

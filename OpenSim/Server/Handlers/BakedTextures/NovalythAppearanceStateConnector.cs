@@ -8,6 +8,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -16,6 +18,7 @@ using System.Text;
 using log4net;
 using Nini.Config;
 using OpenMetaverse;
+using OpenMetaverse.Imaging;
 using OpenMetaverse.StructuredData;
 using OpenSim.Framework;
 using OpenSim.Framework.Servers.HttpServer;
@@ -149,6 +152,51 @@ namespace Novalyth.Server.Appearance
             new(10, "aux3", new[] { WT_UNIVERSAL })
         };
 
+        // Second Life ETextureIndex -> baked texture slot. Baked output texture
+        // indices themselves are intentionally absent: only local/source textures
+        // participate in the C2 source graph.
+        private static readonly IReadOnlyDictionary<int, string> s_sourceTextureBakeSlots =
+            new Dictionary<int, string>
+            {
+                [0] = "head",      // TEX_HEAD_BODYPAINT
+                [1] = "upper",     // TEX_UPPER_SHIRT
+                [2] = "lower",     // TEX_LOWER_PANTS
+                [3] = "eyes",      // TEX_EYES_IRIS
+                [4] = "hair",      // TEX_HAIR
+                [5] = "upper",     // TEX_UPPER_BODYPAINT
+                [6] = "lower",     // TEX_LOWER_BODYPAINT
+                [7] = "lower",     // TEX_LOWER_SHOES
+                [12] = "lower",    // TEX_LOWER_SOCKS
+                [13] = "upper",    // TEX_UPPER_JACKET
+                [14] = "lower",    // TEX_LOWER_JACKET
+                [15] = "upper",    // TEX_UPPER_GLOVES
+                [16] = "upper",    // TEX_UPPER_UNDERSHIRT
+                [17] = "lower",    // TEX_LOWER_UNDERPANTS
+                [18] = "skirt",    // TEX_SKIRT
+                [21] = "lower",    // TEX_LOWER_ALPHA
+                [22] = "upper",    // TEX_UPPER_ALPHA
+                [23] = "head",     // TEX_HEAD_ALPHA
+                [24] = "eyes",     // TEX_EYES_ALPHA
+                [25] = "hair",     // TEX_HAIR_ALPHA
+                [26] = "head",     // TEX_HEAD_TATTOO
+                [27] = "upper",    // TEX_UPPER_TATTOO
+                [28] = "lower",    // TEX_LOWER_TATTOO
+                [29] = "head",     // TEX_HEAD_UNIVERSAL_TATTOO
+                [30] = "upper",    // TEX_UPPER_UNIVERSAL_TATTOO
+                [31] = "lower",    // TEX_LOWER_UNIVERSAL_TATTOO
+                [32] = "skirt",    // TEX_SKIRT_TATTOO
+                [33] = "hair",     // TEX_HAIR_TATTOO
+                [34] = "eyes",     // TEX_EYES_TATTOO
+                [35] = "leftarm",  // TEX_LEFT_ARM_TATTOO
+                [36] = "leftleg",  // TEX_LEFT_LEG_TATTOO
+                [37] = "aux1",     // TEX_AUX1_TATTOO
+                [38] = "aux2",     // TEX_AUX2_TATTOO
+                [39] = "aux3"      // TEX_AUX3_TATTOO
+            };
+
+        private const int MaxWearableParameters = 4096;
+        private const int MaxWearableTextures = 64;
+
         private readonly string m_stateDirectory;
         private readonly string m_manifestDirectory;
         private readonly byte[] m_token;
@@ -178,7 +226,7 @@ namespace Novalyth.Server.Appearance
             m_assets = assets;
 
             m_log.InfoFormat(
-                "[NOVALYTH APPEARANCE C1]: authoritative COF + bake contract online; contract={0}; bake-ready={1}",
+                "[NOVALYTH APPEARANCE C2A]: wearable parser + source graph online; contract={0}; bake-ready={1}",
                 m_bakeContractVersion,
                 m_bakeReady);
         }
@@ -203,11 +251,16 @@ namespace Novalyth.Server.Appearance
                 OSDMap health = new();
                 health["status"] = "ok";
                 health["service"] = "Novalyth Appearance Core";
-                health["phase"] = "C1";
+                health["phase"] = "C2A";
                 health["sl_ssa_protocol_surface"] = true;
                 health["authoritative_cof"] = "Inventory Core";
                 health["bake_contract_version"] = m_bakeContractVersion;
                 health["bake_slot_count"] = s_bakeDefinitions.Length;
+                health["wearable_asset_parser"] = true;
+                health["source_texture_graph"] = true;
+                health["source_j2k_decode_audit"] = true;
+                health["pixel_compositor"] = false;
+                health["bake_asset_store"] = false;
                 health["server_bake_ready"] = m_bakeReady;
                 WriteMap(httpResponse, HttpStatusCode.OK, health);
                 return;
@@ -248,6 +301,14 @@ namespace Novalyth.Server.Appearance
                     if (httpRequest.HttpMethod == "GET")
                     {
                         HandleRecipeBuild(agentID, httpResponse);
+                        return;
+                    }
+                    break;
+
+                case "sourceaudit":
+                    if (httpRequest.HttpMethod == "GET")
+                    {
+                        HandleSourceAudit(agentID, httpResponse);
                         return;
                     }
                     break;
@@ -327,7 +388,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C1]: state read failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2A]: state read failed for {0}: {1}",
                     agentID,
                     e.Message);
             }
@@ -372,7 +433,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C1]: manifest read failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2A]: manifest read failed for {0}: {1}",
                     agentID,
                     e.Message);
                 return null;
@@ -388,7 +449,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C1]: Inventory Core COF lookup failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2A]: Inventory Core COF lookup failed for {0}: {1}",
                     agentID,
                     e.Message);
                 return null;
@@ -467,6 +528,35 @@ namespace Novalyth.Server.Appearance
             }
         }
 
+        private void HandleSourceAudit(UUID agentID, IOSHttpResponse response)
+        {
+            lock (GetAgentLock(agentID))
+            {
+                if (!TryBuildAndPersistRecipe(
+                        agentID,
+                        out OSDMap manifest,
+                        out string error))
+                {
+                    OSDMap fail = new();
+                    fail["success"] = false;
+                    fail["error"] = error;
+                    WriteMap(response, HttpStatusCode.OK, fail);
+                    return;
+                }
+
+                AuditSourceTextures(manifest);
+                SaveManifest(agentID, manifest);
+
+                AppearanceState state = LoadState(agentID);
+                state.ManifestStatus = manifest["status"].AsString();
+                state.UpdatedUtc = DateTime.UtcNow.ToString("O");
+                SaveState(agentID, state);
+
+                manifest["success"] = true;
+                WriteMap(response, HttpStatusCode.OK, manifest);
+            }
+        }
+
         private void HandleIncrement(UUID agentID, IOSHttpResponse response)
         {
             lock (GetAgentLock(agentID))
@@ -494,7 +584,7 @@ namespace Novalyth.Server.Appearance
                 catch (Exception e)
                 {
                     m_log.ErrorFormat(
-                        "[NOVALYTH APPEARANCE C1]: COF version increment failed for {0}: {1}",
+                        "[NOVALYTH APPEARANCE C2A]: COF version increment failed for {0}: {1}",
                         agentID,
                         e.Message);
                     updated = false;
@@ -635,7 +725,7 @@ namespace Novalyth.Server.Appearance
             catch (Exception e)
             {
                 m_log.ErrorFormat(
-                    "[NOVALYTH APPEARANCE C1]: COF content lookup failed for {0}: {1}",
+                    "[NOVALYTH APPEARANCE C2A]: COF content lookup failed for {0}: {1}",
                     agentID,
                     e.Message);
                 error = "cof_read_failed";
@@ -652,6 +742,8 @@ namespace Novalyth.Server.Appearance
             List<RecipeItem> attachments = new();
             List<string> brokenLinks = new();
             List<string> missingAssets = new();
+            List<string> wearableParseErrors = new();
+            List<string> wearableTypeMismatches = new();
 
             foreach (InventoryItemBase link in content.Items)
             {
@@ -697,26 +789,50 @@ namespace Novalyth.Server.Appearance
                     (target.AssetType == (int)AssetType.Bodypart ||
                      target.AssetType == (int)AssetType.Clothing))
                 {
-                    bool present = false;
+                    AssetBase wearableAsset = null;
 
                     if (!target.AssetID.IsZero())
                     {
                         try
                         {
-                            AssetMetadata metadata =
-                                m_assets.GetMetadata(target.AssetID.ToString());
-                            present = metadata != null;
+                            wearableAsset = m_assets.Get(target.AssetID.ToString());
                         }
-                        catch
+                        catch (Exception e)
                         {
-                            present = false;
+                            m_log.WarnFormat(
+                                "[NOVALYTH APPEARANCE C2A]: wearable asset fetch failed {0}: {1}",
+                                target.AssetID,
+                                e.Message);
                         }
                     }
 
-                    item.AssetPresent = present;
+                    item.AssetPresent = wearableAsset?.Data != null;
 
-                    if (!present)
+                    if (!item.AssetPresent)
+                    {
                         missingAssets.Add(target.AssetID.ToString());
+                    }
+                    else if (TryParseWearableAsset(
+                                 wearableAsset.Data,
+                                 out ParsedWearable parsed,
+                                 out string parseError))
+                    {
+                        item.ParsedWearable = parsed;
+                        item.WearablePayloadHash = parsed.ComputeHash();
+                        item.WearableTypeMatchesAsset = parsed.WearableType == item.WearableType;
+                        if (!item.WearableTypeMatchesAsset)
+                        {
+                            wearableTypeMismatches.Add(
+                                target.AssetID + ":inventory=" + item.WearableType +
+                                ",asset=" + parsed.WearableType);
+                        }
+                    }
+                    else
+                    {
+                        item.WearableParseError = parseError;
+                        wearableParseErrors.Add(
+                            target.AssetID + ":" + parseError);
+                    }
 
                     wearables.Add(item);
                 }
@@ -728,6 +844,9 @@ namespace Novalyth.Server.Appearance
 
             wearables.Sort(RecipeItem.Compare);
             attachments.Sort(RecipeItem.Compare);
+
+            List<SourceTextureLayer> sourceLayers = BuildSourceTextureGraph(wearables);
+            List<string> missingSourceAssets = ProbeSourceAssetExistence(sourceLayers);
 
             string recipeHash =
                 ComputeRecipeHash(
@@ -745,18 +864,15 @@ namespace Novalyth.Server.Appearance
             foreach (RecipeItem item in attachments)
                 attachmentArray.Add(item.ToOSD());
 
-            OSDArray brokenArray = new();
-            foreach (string id in brokenLinks.OrderBy(x => x, StringComparer.Ordinal))
-                brokenArray.Add(OSD.FromString(id));
+            OSDArray brokenArray = ToStringArray(brokenLinks);
+            OSDArray missingArray = ToStringArray(missingAssets);
+            OSDArray parseErrorArray = ToStringArray(wearableParseErrors);
+            OSDArray typeMismatchArray = ToStringArray(wearableTypeMismatches);
+            OSDArray missingSourceArray = ToStringArray(missingSourceAssets);
 
-            OSDArray missingArray = new();
-            foreach (string id in missingAssets
-                         .Where(x => !string.IsNullOrEmpty(x))
-                         .Distinct(StringComparer.Ordinal)
-                         .OrderBy(x => x, StringComparer.Ordinal))
-            {
-                missingArray.Add(OSD.FromString(id));
-            }
+            OSDArray sourceTextureArray = new();
+            foreach (SourceTextureLayer layer in sourceLayers)
+                sourceTextureArray.Add(layer.ToOSD());
 
             OSDArray bakes = new();
 
@@ -779,11 +895,25 @@ namespace Novalyth.Server.Appearance
                         contribution["inventory_item_id"] = item.InventoryItemID;
                         contribution["asset_id"] = item.AssetID;
                         contribution["order"] = item.OrderKey;
+                        contribution["wearable_payload_hash"] = item.WearablePayloadHash;
                         contributors.Add(contribution);
                     }
                 }
 
+                OSDArray bakeSourceLayers = new();
+                foreach (SourceTextureLayer layer in sourceLayers)
+                {
+                    if (string.Equals(
+                            layer.BakeSlot,
+                            bake.Name,
+                            StringComparison.Ordinal))
+                    {
+                        bakeSourceLayers.Add(layer.ToOSD());
+                    }
+                }
+
                 bakeMap["contributors"] = contributors;
+                bakeMap["source_layers"] = bakeSourceLayers;
                 bakes.Add(bakeMap);
             }
 
@@ -793,6 +923,7 @@ namespace Novalyth.Server.Appearance
             manifest["cof_version"] = (int)cof.Version;
             manifest["cof_authority"] = "Inventory Core";
             manifest["recipe_hash"] = recipeHash;
+            manifest["recipe_format"] = "novalyth-ssa-recipe-v2";
             manifest["bake_contract_version"] = m_bakeContractVersion;
             manifest["bake_slot_count"] = s_bakeDefinitions.Length;
             manifest["generated_utc"] = DateTime.UtcNow.ToString("O");
@@ -800,12 +931,27 @@ namespace Novalyth.Server.Appearance
             manifest["attachments"] = attachmentArray;
             manifest["broken_links"] = brokenArray;
             manifest["missing_assets"] = missingArray;
+            manifest["wearable_parse_errors"] = parseErrorArray;
+            manifest["wearable_type_mismatches"] = typeMismatchArray;
+            manifest["source_textures"] = sourceTextureArray;
+            manifest["missing_source_assets"] = missingSourceArray;
+            manifest["source_texture_count"] = sourceLayers.Count;
+            manifest["source_audit_status"] = "not_run";
+            manifest["pixel_compositor_status"] = "not_implemented_c2a";
             manifest["bakes"] = bakes;
 
-            if (brokenLinks.Count > 0 || missingAssets.Count > 0)
+            if (brokenLinks.Count > 0 ||
+                missingAssets.Count > 0 ||
+                wearableParseErrors.Count > 0 ||
+                wearableTypeMismatches.Count > 0 ||
+                missingSourceAssets.Count > 0)
+            {
                 manifest["status"] = "recipe_incomplete";
+            }
             else
-                manifest["status"] = "recipe_ready";
+            {
+                manifest["status"] = "recipe_source_ready";
+            }
 
             SaveManifest(agentID, manifest);
 
@@ -821,6 +967,389 @@ namespace Novalyth.Server.Appearance
             return true;
         }
 
+        private static OSDArray ToStringArray(IEnumerable<string> values)
+        {
+            OSDArray result = new();
+
+            foreach (string value in values
+                         .Where(x => !string.IsNullOrEmpty(x))
+                         .Distinct(StringComparer.Ordinal)
+                         .OrderBy(x => x, StringComparer.Ordinal))
+            {
+                result.Add(OSD.FromString(value));
+            }
+
+            return result;
+        }
+
+        private List<string> ProbeSourceAssetExistence(
+            IEnumerable<SourceTextureLayer> layers)
+        {
+            List<string> missing = new();
+
+            foreach (UUID textureID in layers
+                         .Select(x => x.TextureID)
+                         .Where(x => !x.IsZero())
+                         .Distinct()
+                         .OrderBy(x => x.ToString(), StringComparer.Ordinal))
+            {
+                bool present = false;
+
+                try
+                {
+                    present = m_assets.GetMetadata(textureID.ToString()) != null;
+                }
+                catch
+                {
+                    present = false;
+                }
+
+                if (!present)
+                    missing.Add(textureID.ToString());
+            }
+
+            return missing;
+        }
+
+        private static List<SourceTextureLayer> BuildSourceTextureGraph(
+            IEnumerable<RecipeItem> wearables)
+        {
+            List<SourceTextureLayer> result = new();
+            int sequence = 0;
+
+            foreach (RecipeItem item in wearables)
+            {
+                if (item.ParsedWearable == null)
+                    continue;
+
+                foreach (WearableTexture texture in item.ParsedWearable.Textures
+                             .OrderBy(x => x.TextureIndex))
+                {
+                    if (!s_sourceTextureBakeSlots.TryGetValue(
+                            texture.TextureIndex,
+                            out string bakeSlot))
+                    {
+                        continue;
+                    }
+
+                    if (texture.TextureID.IsZero())
+                        continue;
+
+                    result.Add(new SourceTextureLayer
+                    {
+                        Sequence = sequence++,
+                        BakeSlot = bakeSlot,
+                        TextureIndex = texture.TextureIndex,
+                        TextureID = texture.TextureID,
+                        WearableType = item.WearableType,
+                        InventoryItemID = item.InventoryItemID,
+                        WearableAssetID = item.AssetID,
+                        OrderKey = item.OrderKey ?? string.Empty
+                    });
+                }
+            }
+
+            return result;
+        }
+
+        private void AuditSourceTextures(OSDMap manifest)
+        {
+            if (!manifest.TryGetValue("source_textures", out OSD sourceOSD) ||
+                sourceOSD is not OSDArray sourceTextures)
+            {
+                manifest["source_audit_status"] = "no_source_graph";
+                manifest["status"] = "recipe_incomplete";
+                return;
+            }
+
+            Dictionary<UUID, SourceDecodeResult> decoded = new();
+            OSDArray decodeErrors = new();
+            int successfulUnique = 0;
+
+            foreach (OSD entry in sourceTextures)
+            {
+                if (entry is not OSDMap layer ||
+                    !layer.TryGetValue("texture_id", out OSD textureOSD) ||
+                    !UUID.TryParse(textureOSD.AsString(), out UUID textureID) ||
+                    textureID.IsZero())
+                {
+                    continue;
+                }
+
+                if (!decoded.TryGetValue(textureID, out SourceDecodeResult result))
+                {
+                    result = DecodeSourceTexture(textureID);
+                    decoded[textureID] = result;
+                    if (result.Success)
+                        successfulUnique++;
+                    else
+                        decodeErrors.Add(OSD.FromString(
+                            textureID + ":" + result.Error));
+                }
+
+                layer["decode_status"] = result.Success ? "decoded" : "decode_failed";
+                layer["width"] = result.Width;
+                layer["height"] = result.Height;
+                layer["asset_type"] = result.AssetType;
+                layer["decode_error"] = result.Error ?? string.Empty;
+            }
+
+            manifest["source_audit_utc"] = DateTime.UtcNow.ToString("O");
+            manifest["source_unique_texture_count"] = decoded.Count;
+            manifest["source_decoded_unique_count"] = successfulUnique;
+            manifest["source_decode_errors"] = decodeErrors;
+
+            if (decodeErrors.Count == 0)
+            {
+                manifest["source_audit_status"] = "source_j2k_ready";
+
+                if (manifest["status"].AsString() == "recipe_source_ready")
+                    manifest["status"] = "source_decode_ready";
+            }
+            else
+            {
+                manifest["source_audit_status"] = "source_j2k_incomplete";
+                manifest["status"] = "recipe_incomplete";
+            }
+        }
+
+        private SourceDecodeResult DecodeSourceTexture(UUID textureID)
+        {
+            try
+            {
+                AssetBase asset = m_assets.Get(textureID.ToString());
+                if (asset?.Data == null || asset.Data.Length == 0)
+                {
+                    return SourceDecodeResult.Fail("asset_not_found");
+                }
+
+                ManagedImage managedImage;
+                Image image;
+
+                if (!OpenJPEG.DecodeToImage(
+                        asset.Data,
+                        out managedImage,
+                        out image) || image == null)
+                {
+                    return SourceDecodeResult.Fail("j2k_decode_failed", asset.Type);
+                }
+
+                try
+                {
+                    return SourceDecodeResult.Ok(
+                        image.Width,
+                        image.Height,
+                        asset.Type);
+                }
+                finally
+                {
+                    image.Dispose();
+                }
+            }
+            catch (Exception e)
+            {
+                m_log.WarnFormat(
+                    "[NOVALYTH APPEARANCE C2A]: source texture decode failed {0}: {1}",
+                    textureID,
+                    e.Message);
+                return SourceDecodeResult.Fail(e.GetType().Name);
+            }
+        }
+
+        private static bool TryParseWearableAsset(
+            byte[] data,
+            out ParsedWearable parsed,
+            out string error)
+        {
+            parsed = null;
+            error = string.Empty;
+
+            if (data == null || data.Length == 0)
+            {
+                error = "empty_wearable_asset";
+                return false;
+            }
+
+            string text;
+            try
+            {
+                text = Encoding.UTF8.GetString(data);
+            }
+            catch
+            {
+                error = "wearable_text_decode_failed";
+                return false;
+            }
+
+            using StringReader reader = new(text);
+            ParsedWearable result = new();
+            bool sawType = false;
+            bool sawParameters = false;
+            bool sawTextures = false;
+            string line;
+
+            while ((line = reader.ReadLine()) != null)
+            {
+                string trimmed = line.Trim();
+                if (trimmed.Length == 0)
+                    continue;
+
+                if (trimmed.StartsWith("type ", StringComparison.Ordinal))
+                {
+                    string value = trimmed.Substring(5).Trim();
+                    if (!int.TryParse(
+                            value,
+                            NumberStyles.Integer,
+                            CultureInfo.InvariantCulture,
+                            out int wearableType))
+                    {
+                        error = "invalid_wearable_type";
+                        return false;
+                    }
+
+                    result.WearableType = wearableType;
+                    sawType = true;
+                    continue;
+                }
+
+                if (trimmed.StartsWith("parameters ", StringComparison.Ordinal))
+                {
+                    if (!TryParseCount(trimmed, "parameters", MaxWearableParameters, out int count))
+                    {
+                        error = "invalid_parameters_header";
+                        return false;
+                    }
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        string paramLine = ReadNextPopulatedLine(reader);
+                        if (paramLine == null)
+                        {
+                            error = "unexpected_eof_parameters";
+                            return false;
+                        }
+
+                        string[] fields = paramLine.Split(
+                            (char[])null,
+                            StringSplitOptions.RemoveEmptyEntries);
+
+                        if (fields.Length < 2 ||
+                            !int.TryParse(
+                                fields[0],
+                                NumberStyles.Integer,
+                                CultureInfo.InvariantCulture,
+                                out int id) ||
+                            !float.TryParse(
+                                fields[1],
+                                NumberStyles.Float,
+                                CultureInfo.InvariantCulture,
+                                out float weight))
+                        {
+                            error = "invalid_parameter_entry";
+                            return false;
+                        }
+
+                        result.Parameters.Add(new WearableParameter(id, weight));
+                    }
+
+                    sawParameters = true;
+                    continue;
+                }
+
+                if (trimmed.StartsWith("textures ", StringComparison.Ordinal))
+                {
+                    if (!TryParseCount(trimmed, "textures", MaxWearableTextures, out int count))
+                    {
+                        error = "invalid_textures_header";
+                        return false;
+                    }
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        string textureLine = ReadNextPopulatedLine(reader);
+                        if (textureLine == null)
+                        {
+                            error = "unexpected_eof_textures";
+                            return false;
+                        }
+
+                        string[] fields = textureLine.Split(
+                            (char[])null,
+                            StringSplitOptions.RemoveEmptyEntries);
+
+                        if (fields.Length < 2 ||
+                            !int.TryParse(
+                                fields[0],
+                                NumberStyles.Integer,
+                                CultureInfo.InvariantCulture,
+                                out int textureIndex) ||
+                            textureIndex < 0 || textureIndex >= 45 ||
+                            !UUID.TryParse(fields[1], out UUID textureID))
+                        {
+                            error = "invalid_texture_entry";
+                            return false;
+                        }
+
+                        result.Textures.Add(
+                            new WearableTexture(textureIndex, textureID));
+                    }
+
+                    sawTextures = true;
+                }
+            }
+
+            if (!sawType)
+            {
+                error = "missing_wearable_type";
+                return false;
+            }
+
+            if (!sawParameters)
+            {
+                error = "missing_parameters_block";
+                return false;
+            }
+
+            if (!sawTextures)
+            {
+                error = "missing_textures_block";
+                return false;
+            }
+
+            parsed = result;
+            return true;
+        }
+
+        private static bool TryParseCount(
+            string line,
+            string keyword,
+            int maximum,
+            out int count)
+        {
+            count = 0;
+            string value = line.Substring(keyword.Length).Trim();
+            return int.TryParse(
+                       value,
+                       NumberStyles.Integer,
+                       CultureInfo.InvariantCulture,
+                       out count)
+                && count >= 0
+                && count <= maximum;
+        }
+
+        private static string ReadNextPopulatedLine(StringReader reader)
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                line = line.Trim();
+                if (line.Length > 0)
+                    return line;
+            }
+
+            return null;
+        }
+
         private static string ComputeRecipeHash(
             UUID agentID,
             InventoryFolderBase cof,
@@ -830,7 +1359,7 @@ namespace Novalyth.Server.Appearance
         {
             StringBuilder canonical = new();
 
-            canonical.Append("novalyth-ssa-recipe-v1\n");
+            canonical.Append("novalyth-ssa-recipe-v2\n");
             canonical.Append(agentID).Append('\n');
             canonical.Append(cof.ID).Append('\n');
             canonical.Append(cof.Version).Append('\n');
@@ -929,6 +1458,10 @@ namespace Novalyth.Server.Appearance
             public string Name = string.Empty;
             public string OrderKey = string.Empty;
             public bool AssetPresent;
+            public ParsedWearable ParsedWearable;
+            public string WearableParseError = string.Empty;
+            public string WearablePayloadHash = string.Empty;
+            public bool WearableTypeMatchesAsset;
 
             public static int Compare(RecipeItem a, RecipeItem b)
             {
@@ -961,7 +1494,8 @@ namespace Novalyth.Server.Appearance
                     AssetType,
                     InventoryType,
                     Flags,
-                    OrderKey ?? string.Empty);
+                    OrderKey ?? string.Empty,
+                    WearablePayloadHash ?? string.Empty);
             }
 
             public OSDMap ToOSD()
@@ -977,7 +1511,165 @@ namespace Novalyth.Server.Appearance
                 map["name"] = Name ?? string.Empty;
                 map["order"] = OrderKey ?? string.Empty;
                 map["asset_present"] = AssetPresent;
+                map["wearable_parse_status"] = ParsedWearable != null
+                    ? "parsed"
+                    : (AssetPresent ? "parse_failed" : "asset_missing");
+                map["wearable_parse_error"] = WearableParseError ?? string.Empty;
+                map["wearable_payload_hash"] = WearablePayloadHash ?? string.Empty;
+
+                if (ParsedWearable != null)
+                {
+                    map["asset_wearable_type"] = ParsedWearable.WearableType;
+                    map["wearable_type_matches_asset"] = WearableTypeMatchesAsset;
+                    map["parameters"] = ParsedWearable.ParametersToOSD();
+                    map["textures"] = ParsedWearable.TexturesToOSD();
+                }
+
                 return map;
+            }
+        }
+
+        private sealed class ParsedWearable
+        {
+            public int WearableType = -1;
+            public List<WearableParameter> Parameters { get; } = new();
+            public List<WearableTexture> Textures { get; } = new();
+
+            public string ComputeHash()
+            {
+                StringBuilder canonical = new();
+                canonical.Append("wearable-v1|").Append(WearableType).Append('\n');
+
+                foreach (WearableParameter parameter in Parameters.OrderBy(x => x.ID))
+                {
+                    canonical.Append("P|")
+                        .Append(parameter.ID)
+                        .Append('|')
+                        .Append(parameter.Weight.ToString("R", CultureInfo.InvariantCulture))
+                        .Append('\n');
+                }
+
+                foreach (WearableTexture texture in Textures.OrderBy(x => x.TextureIndex))
+                {
+                    canonical.Append("T|")
+                        .Append(texture.TextureIndex)
+                        .Append('|')
+                        .Append(texture.TextureID)
+                        .Append('\n');
+                }
+
+                byte[] digest = SHA256.HashData(
+                    Encoding.UTF8.GetBytes(canonical.ToString()));
+                return Convert.ToHexString(digest).ToLowerInvariant();
+            }
+
+            public OSDArray ParametersToOSD()
+            {
+                OSDArray result = new();
+                foreach (WearableParameter parameter in Parameters.OrderBy(x => x.ID))
+                {
+                    OSDMap entry = new();
+                    entry["id"] = parameter.ID;
+                    entry["weight"] = parameter.Weight;
+                    result.Add(entry);
+                }
+                return result;
+            }
+
+            public OSDArray TexturesToOSD()
+            {
+                OSDArray result = new();
+                foreach (WearableTexture texture in Textures.OrderBy(x => x.TextureIndex))
+                {
+                    OSDMap entry = new();
+                    entry["texture_index"] = texture.TextureIndex;
+                    entry["texture_id"] = texture.TextureID;
+                    entry["bake_slot"] = s_sourceTextureBakeSlots.TryGetValue(
+                        texture.TextureIndex,
+                        out string bakeSlot) ? bakeSlot : string.Empty;
+                    result.Add(entry);
+                }
+                return result;
+            }
+        }
+
+        private readonly struct WearableParameter
+        {
+            public int ID { get; }
+            public float Weight { get; }
+
+            public WearableParameter(int id, float weight)
+            {
+                ID = id;
+                Weight = weight;
+            }
+        }
+
+        private readonly struct WearableTexture
+        {
+            public int TextureIndex { get; }
+            public UUID TextureID { get; }
+
+            public WearableTexture(int textureIndex, UUID textureID)
+            {
+                TextureIndex = textureIndex;
+                TextureID = textureID;
+            }
+        }
+
+        private sealed class SourceTextureLayer
+        {
+            public int Sequence;
+            public string BakeSlot = string.Empty;
+            public int TextureIndex;
+            public UUID TextureID;
+            public int WearableType;
+            public UUID InventoryItemID;
+            public UUID WearableAssetID;
+            public string OrderKey = string.Empty;
+
+            public OSDMap ToOSD()
+            {
+                OSDMap map = new();
+                map["sequence"] = Sequence;
+                map["bake_slot"] = BakeSlot ?? string.Empty;
+                map["texture_index"] = TextureIndex;
+                map["texture_id"] = TextureID;
+                map["wearable_type"] = WearableType;
+                map["inventory_item_id"] = InventoryItemID;
+                map["wearable_asset_id"] = WearableAssetID;
+                map["order"] = OrderKey ?? string.Empty;
+                return map;
+            }
+        }
+
+        private sealed class SourceDecodeResult
+        {
+            public bool Success;
+            public int Width;
+            public int Height;
+            public int AssetType;
+            public string Error = string.Empty;
+
+            public static SourceDecodeResult Ok(int width, int height, int assetType)
+            {
+                return new SourceDecodeResult
+                {
+                    Success = true,
+                    Width = width,
+                    Height = height,
+                    AssetType = assetType
+                };
+            }
+
+            public static SourceDecodeResult Fail(string error, int assetType = -1)
+            {
+                return new SourceDecodeResult
+                {
+                    Success = false,
+                    AssetType = assetType,
+                    Error = error ?? string.Empty
+                };
             }
         }
 
