@@ -43,6 +43,8 @@ namespace OpenSim.Services.InventoryService
         private static readonly ILog m_log = LogManager.GetLogger(MethodBase.GetCurrentMethod().DeclaringType);
 
         protected IXInventoryData m_Database;
+        protected IXInventoryDataBatch m_BatchDatabase;
+        private int m_NativeBatchLogOnce;
         protected bool m_AllowDelete = true;
         protected string m_ConfigName = "InventoryService";
 
@@ -94,6 +96,12 @@ namespace OpenSim.Services.InventoryService
 
             if (m_Database == null)
                 throw new Exception("Could not find a storage interface in the given module");
+
+            m_BatchDatabase = m_Database as IXInventoryDataBatch;
+            if (m_BatchDatabase != null)
+                m_log.Info("[NOVALYTH INVENTORY BATCH]: Native database batching ENABLED");
+            else
+                m_log.Info("[NOVALYTH INVENTORY BATCH]: Native database batching unavailable; legacy compatibility path active");
         }
 
         public virtual bool CreateUserInventory(UUID principalID)
@@ -341,12 +349,108 @@ namespace OpenSim.Services.InventoryService
 
         public virtual InventoryCollection[] GetMultipleFoldersContent(UUID principalID, UUID[] folderIDs)
         {
-            InventoryCollection[] multiple = new InventoryCollection[folderIDs.Length];
-            int i = 0;
-            foreach (UUID fid in folderIDs)
-                multiple[i++] = GetFolderContent(principalID, fid);
+            if (folderIDs == null || folderIDs.Length == 0)
+                return [];
 
-            return multiple;
+            if (m_BatchDatabase == null)
+            {
+                InventoryCollection[] legacy = new InventoryCollection[folderIDs.Length];
+                int legacyIndex = 0;
+                foreach (UUID fid in folderIDs)
+                    legacy[legacyIndex++] = GetFolderContent(principalID, fid);
+
+                return legacy;
+            }
+
+            try
+            {
+                if (System.Threading.Interlocked.Exchange(ref m_NativeBatchLogOnce, 1) == 0)
+                {
+                    m_log.InfoFormat(
+                        "[NOVALYTH INVENTORY BATCH]: Native multi-folder path active; first request folders={0}, backend queries=3",
+                        folderIDs.Length);
+                }
+
+                InventoryCollection[] multiple = new InventoryCollection[folderIDs.Length];
+                Dictionary<UUID, List<int>> positions = new();
+                string[] folderIDStrings = new string[folderIDs.Length];
+
+                for (int i = 0; i < folderIDs.Length; ++i)
+                {
+                    UUID fid = folderIDs[i];
+                    folderIDStrings[i] = fid.ToString();
+
+                    multiple[i] = new InventoryCollection
+                    {
+                        FolderID = fid,
+                        OwnerID = principalID,
+                        Folders = [],
+                        Items = []
+                    };
+
+                    if (!positions.TryGetValue(fid, out List<int> indexes))
+                    {
+                        indexes = [];
+                        positions[fid] = indexes;
+                    }
+
+                    indexes.Add(i);
+                }
+
+                XInventoryFolder[] childFolders =
+                    m_BatchDatabase.GetFoldersByParentIDs(folderIDStrings);
+
+                foreach (XInventoryFolder folder in childFolders)
+                {
+                    if (!positions.TryGetValue(folder.parentFolderID, out List<int> indexes))
+                        continue;
+
+                    foreach (int index in indexes)
+                        multiple[index].Folders.Add(ConvertToOpenSim(folder));
+                }
+
+                XInventoryItem[] items =
+                    m_BatchDatabase.GetItemsByParentIDs(folderIDStrings);
+
+                foreach (XInventoryItem item in items)
+                {
+                    if (!positions.TryGetValue(item.parentFolderID, out List<int> indexes))
+                        continue;
+
+                    foreach (int index in indexes)
+                        multiple[index].Items.Add(ConvertToOpenSim(item));
+                }
+
+                XInventoryFolder[] metadata =
+                    m_BatchDatabase.GetFoldersByIDs(folderIDStrings);
+
+                foreach (XInventoryFolder folder in metadata)
+                {
+                    if (!positions.TryGetValue(folder.folderID, out List<int> indexes))
+                        continue;
+
+                    foreach (int index in indexes)
+                    {
+                        multiple[index].Version = folder.version;
+                        multiple[index].OwnerID = folder.agentID;
+                    }
+                }
+
+                return multiple;
+            }
+            catch (Exception e)
+            {
+                m_log.WarnFormat(
+                    "[NOVALYTH INVENTORY BATCH]: Native batch failed, using legacy path: {0}",
+                    e.Message);
+
+                InventoryCollection[] legacy = new InventoryCollection[folderIDs.Length];
+                int legacyIndex = 0;
+                foreach (UUID fid in folderIDs)
+                    legacy[legacyIndex++] = GetFolderContent(principalID, fid);
+
+                return legacy;
+            }
         }
 
         public virtual List<InventoryItemBase> GetFolderItems(UUID principalID, UUID folderID)

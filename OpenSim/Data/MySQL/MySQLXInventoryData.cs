@@ -37,7 +37,7 @@ namespace OpenSim.Data.MySQL
     /// <summary>
     /// A MySQL Interface for the Inventory Server
     /// </summary>
-    public class MySQLXInventoryData : IXInventoryData
+    public class MySQLXInventoryData : IXInventoryData, IXInventoryDataBatch
     {
         private MySqlFolderHandler m_Folders;
         private MySqlItemHandler m_Items;
@@ -61,6 +61,21 @@ namespace OpenSim.Data.MySQL
         public XInventoryItem[] GetItems(string[] fields, string[] vals)
         {
             return m_Items.Get(fields, vals);
+        }
+
+        public XInventoryFolder[] GetFoldersByParentIDs(string[] parentFolderIDs)
+        {
+            return m_Folders.Get("parentFolderID", parentFolderIDs);
+        }
+
+        public XInventoryItem[] GetItemsByParentIDs(string[] parentFolderIDs)
+        {
+            return m_Items.Get("parentFolderID", parentFolderIDs);
+        }
+
+        public XInventoryFolder[] GetFoldersByIDs(string[] folderIDs)
+        {
+            return m_Folders.Get("folderID", folderIDs);
         }
 
         public bool StoreFolder(XInventoryFolder folder)

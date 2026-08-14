@@ -76,6 +76,18 @@ namespace OpenSim.Data
         }
     }
 
+    /// <summary>
+    /// Optional high-throughput inventory data capability.
+    /// Implementations can retrieve rows for multiple folder ids in one
+    /// backend query while IXInventoryData keeps its compatibility contract.
+    /// </summary>
+    public interface IXInventoryDataBatch
+    {
+        XInventoryFolder[] GetFoldersByParentIDs(string[] parentFolderIDs);
+        XInventoryItem[] GetItemsByParentIDs(string[] parentFolderIDs);
+        XInventoryFolder[] GetFoldersByIDs(string[] folderIDs);
+    }
+
     public interface IXInventoryData
     {
         XInventoryFolder[] GetFolder(string field, string val);

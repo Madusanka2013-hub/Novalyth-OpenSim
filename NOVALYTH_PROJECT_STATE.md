@@ -930,3 +930,38 @@ Status: **PLANNED / NOT NOW**
 - Firestorm should ultimately only require the public login/grid URI.
 - Public edges/proxies will route internally to the separated Novalyth cores.
 - This work is deferred until the current core/service architecture and performance work is further completed.
+
+## R2 Inventory Performance – Native DB Batching
+
+Status: **DEV RUNTIME VALIDATED**
+
+Date: 2026-08-14
+
+Implementation:
+
+- added optional `IXInventoryDataBatch` capability without breaking the legacy `IXInventoryData` contract;
+- MySQL/MariaDB exposes the existing generic parameterized `IN (...)` query path;
+- `XInventoryService.GetMultipleFoldersContent()` uses native DB batching when the capability exists;
+- one multi-folder request now performs three backend selects regardless of the number of requested folders:
+  - child folders by `parentFolderID IN (...)`;
+  - items by `parentFolderID IN (...)`;
+  - requested folder metadata by `folderID IN (...)`;
+- non-batch database providers and runtime batch failures automatically fall back to the legacy implementation;
+- only the dedicated Inventory Core was restarted for deployment;
+- DEV Robust, DEV Region, Asset Core and LIVE remained running.
+
+Validation:
+
+- pre-patch multi-folder request passed;
+- patched solution built successfully before runtime deployment;
+- Inventory Core loaded `IXInventoryDataBatch` for the MySQL/MariaDB provider;
+- a real `GETMULTIPLEFOLDERSCONTENT` request executed the native batch path;
+- no native-batch fallback was observed;
+- all requested folder IDs were returned;
+- Inventory Core remained service-ready on 8120;
+- Asset Core 8110, Robust 8102/8103 and Region 9100 stayed healthy.
+
+Next:
+
+- inventory request coalescing / short-lived folder cache;
+- bounded concurrency and worker/fairness controls only after reducing duplicate work.
