@@ -823,10 +823,13 @@ namespace Novalyth.Server.Appearance
                 previous["pixel_compositor_status"].AsString();
             current["compositor_profile"] =
                 previous["compositor_profile"].AsString();
+            current["compositor_semantics"] =
+                "official_avatar_lad_order_static_tga_global_param_colors_alpha_bump_modern_11_slot_sources";
             current["bake_asset_store_status"] = "asset_core_ready";
             current["bake_asset_authority"] = "Asset Core";
             current["bake_generated_utc"] =
                 previous["bake_generated_utc"].AsString();
+            current["central_bake_advertised"] = false;
             current["status"] = "c2b2_bakes_ready_not_advertised";
             return true;
         }

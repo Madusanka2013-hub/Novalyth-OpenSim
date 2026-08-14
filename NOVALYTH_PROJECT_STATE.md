@@ -1467,3 +1467,19 @@ Viewer validation:
 - Only Appearance Core is restarted.
 - DEV Region, DEV Robust, Asset Core process, Inventory Core process and LIVE remain untouched.
 - Next: C2B2 real-avatar bake/reuse audit, then C3 Firestorm SSA protocol validation.
+
+## Appearance Core Phase C2B2.1 – reuse manifest metadata consistency (20260814-143350)
+
+- Base commit: `3c67d43a40fff66a21f4ed109b7432fa49e661ab`.
+- C2B2 real-avatar audit passed:
+  - C2B1 -> C2B2 reuse barrier PASS.
+  - C2B1/C2B2 deterministic asset namespace separation PASS.
+  - C2B2 second-run Asset Core reuse PASS.
+  - 11/11 bakes stored and deterministic.
+- Audit exposed one metadata-only issue: a reused C2B2 manifest did not repopulate
+  `compositor_semantics`, so the field became empty after the second bake.
+- Reuse now explicitly restores the canonical C2B2 compositor semantics string and
+  reasserts `central_bake_advertised=false`.
+- No bake recipe, J2K compositor, Asset Core ID namespace, output dimensions,
+  COF handling or viewer protocol surface changes.
+- CentralBakeVersion remains disabled.
