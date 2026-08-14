@@ -703,3 +703,44 @@ Stage 4.1 now provides:
 Before any LIVE rollout, perform the remaining shutdown/reload release-path audit so a region close/reload cannot leave static fair-dispatch/guard accounting stale inside a still-running process.
 
 Next R1 architectural step after that safety audit: split the Asset Service / Asset Edge into its own coarse-grained service boundary.
+
+### R1 Stage 4.1 – Shutdown/Reload Lifecycle Hardening
+
+Status: **SOURCE HARDENED – BUILD/VERIFY THROUGH `novalyth-save`**
+
+Audit finding:
+
+OpenSim upstream `GetAssetsModule.DoAssetRequests()` returns immediately when
+`m_NumberScenes <= 0`. After Stage 4/4.1 introduced guard and fair-dispatch
+accounting, that upstream early return could bypass the request-finally release
+path if the last region disappeared after a request was dispatched but before
+its worker callback started.
+
+A second lifecycle risk existed because the Stage-4.1 per-agent fair queues are
+static process state. Queued-but-not-dispatched requests therefore needed an
+explicit last-region drain before `ObjectJobEngine.Dispose()`.
+
+Hardening:
+
+- fair admission is gated while the last region is closing;
+- fair dispatch stops feeding new work into `ObjectJobEngine` during shutdown;
+- queued-but-not-dispatched requests are explicitly drained;
+- drained requests release their `NovalythAssetQueueGuard` slot;
+- drained PollService requests receive a lifecycle `503 region-shutdown`
+  completion instead of remaining parked;
+- `DoAssetRequests()` no longer has a pre-finally `m_NumberScenes <= 0` return;
+- every dispatched request reaches guard release and
+  `CompleteFairAssetRequest()` in `finally`;
+- last-region `Close()` waits for the at-most-3 already-dispatched requests to
+  finish before disposing `ObjectJobEngine`;
+- the wait is bounded by the configured asset fetch timeout plus a safety margin;
+- if that defensive wait times out, the workerpool is retained rather than
+  disposed, because upstream `ObjectJobEngine.Dispose()` cancels its internal
+  queue and could otherwise drop a tracked request before its callback runs;
+- when a region becomes active again, fair admission is reopened and dispatch
+  slots are refreshed from `Cap_AssetWorkers`.
+
+This does not change normal scheduling, worker counts, queue limits or Stage-3
+response wake behavior.
+
+No LIVE deployment is performed by this source patch.

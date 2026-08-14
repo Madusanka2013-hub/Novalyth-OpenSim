@@ -92,6 +92,7 @@ namespace OpenSim.Region.ClientStack.Linden
         private static int m_assetMaxOutstandingPerAgent = 0;
         private static int m_queueCommandsRegistered = 0;
         private static int m_assetFairDispatchSlots = 3;
+        private static bool m_assetFairStopping = false;
 
         private static readonly object m_assetFairLock = new();
         private static readonly Dictionary<UUID, Queue<APollRequest>> m_assetFairQueues = new();
@@ -165,11 +166,14 @@ namespace OpenSim.Region.ClientStack.Linden
 
         private static bool EnqueueFairAssetRequest(APollRequest request)
         {
-            if (request == null || request.reqID.IsZero() || m_workerpool == null)
+            if (request == null || request.reqID.IsZero())
                 return false;
 
             lock (m_assetFairLock)
             {
+                if (m_assetFairStopping || m_workerpool == null)
+                    return false;
+
                 if (!m_assetFairQueues.TryGetValue(
                         request.queueAgentID,
                         out Queue<APollRequest> queue))
@@ -206,7 +210,9 @@ namespace OpenSim.Region.ClientStack.Linden
 
         private static void DispatchFairAssetRequestsLocked()
         {
-            while (m_assetFairInFlight < m_assetFairDispatchSlots
+            while (!m_assetFairStopping
+                && m_workerpool != null
+                && m_assetFairInFlight < m_assetFairDispatchSlots
                 && m_assetFairRoundRobin.Count > 0)
             {
                 UUID agentID = m_assetFairRoundRobin.Dequeue();
@@ -251,6 +257,69 @@ namespace OpenSim.Region.ClientStack.Linden
                         next,
                         "worker-unavailable");
                 }
+            }
+        }
+
+        private static int StopAndDrainFairAssetRequests()
+        {
+            List<APollRequest> drained = new();
+
+            lock (m_assetFairLock)
+            {
+                m_assetFairStopping = true;
+
+                foreach (Queue<APollRequest> queue in m_assetFairQueues.Values)
+                {
+                    while (queue.Count > 0)
+                        drained.Add(queue.Dequeue());
+                }
+
+                m_assetFairQueues.Clear();
+                m_assetFairRoundRobin.Clear();
+                m_assetFairQueued = 0;
+            }
+
+            foreach (APollRequest request in drained)
+            {
+                if (request.queueGuardTracked)
+                {
+                    NovalythAssetQueueGuard.Release(request.queueAgentID);
+                    request.queueGuardTracked = false;
+                }
+
+                try
+                {
+                    request.thepoll.FailQueuedRequest(
+                        request,
+                        "region-shutdown");
+                }
+                catch (Exception e)
+                {
+                    m_log.WarnFormat(
+                        "[GETASSETS]: failed to finish queued asset request during shutdown: {0}",
+                        e.Message);
+                }
+            }
+
+            return drained.Count;
+        }
+
+        private static bool WaitForFairAssetInflightDrain(int timeoutMs)
+        {
+            long deadline = Environment.TickCount64 + Math.Max(1000, timeoutMs);
+
+            while (true)
+            {
+                lock (m_assetFairLock)
+                {
+                    if (m_assetFairInFlight <= 0)
+                        return true;
+                }
+
+                if (Environment.TickCount64 >= deadline)
+                    return false;
+
+                Thread.Sleep(10);
             }
         }
 
@@ -380,6 +449,12 @@ namespace OpenSim.Region.ClientStack.Linden
 
                 m_NumberScenes++;
 
+                lock (m_assetFairLock)
+                {
+                    m_assetFairStopping = false;
+                    m_assetFairDispatchSlots = m_capsAssetWorkers;
+                }
+
                 if (m_workerpool == null)
                 {
                     m_assetFairDispatchSlots = m_capsAssetWorkers;
@@ -420,10 +495,38 @@ namespace OpenSim.Region.ClientStack.Linden
 
         public void Close()
         {
-            if(m_NumberScenes <= 0 && m_workerpool != null)
+            lock (m_loadLock)
             {
-                m_workerpool.Dispose();
-                m_workerpool = null;
+                if (m_NumberScenes > 0)
+                    return;
+
+                int drained = StopAndDrainFairAssetRequests();
+
+                if (drained > 0)
+                {
+                    m_log.InfoFormat(
+                        "[GETASSETS]: shutdown drained {0} queued fair asset requests",
+                        drained);
+                }
+
+                if (m_workerpool != null)
+                {
+                    int drainTimeoutMs =
+                        Math.Clamp(m_assetFetchTimeoutMs + 5000, 6000, 125000);
+
+                    if (WaitForFairAssetInflightDrain(drainTimeoutMs))
+                    {
+                        m_workerpool.Dispose();
+                        m_workerpool = null;
+                    }
+                    else
+                    {
+                        m_log.ErrorFormat(
+                            "[GETASSETS]: shutdown fair-dispatch drain timed out after {0} ms; " +
+                            "workerpool retained to avoid dropping tracked in-flight requests",
+                            drainTimeoutMs);
+                    }
+                }
             }
         }
 
@@ -433,39 +536,46 @@ namespace OpenSim.Region.ClientStack.Linden
 
         private static void DoAssetRequests(object o)
         {
-            if (m_NumberScenes <= 0)
-                return;
             APollRequest poolreq = o as APollRequest;
-            if (poolreq != null && !poolreq.reqID.IsZero())
+            if (poolreq == null || poolreq.reqID.IsZero())
+                return;
+
+            try
             {
-                NovalythAssetPipelineMetrics.CapsDequeued(
-                    Environment.TickCount64 - poolreq.enqueuedAtMs);
-                try
+                if (m_NumberScenes <= 0)
+                {
+                    poolreq.thepoll.FailQueuedRequest(
+                        poolreq,
+                        "region-shutdown");
+                }
+                else
                 {
                     poolreq.thepoll.Process(poolreq);
                 }
-                finally
+            }
+            finally
+            {
+                if (poolreq.queueGuardTracked)
                 {
-                    if (poolreq.queueGuardTracked)
-                    {
-                        NovalythAssetQueueGuard.Release(poolreq.queueAgentID);
-                        poolreq.queueGuardTracked = false;
-                    }
-
-                    CompleteFairAssetRequest();
+                    NovalythAssetQueueGuard.Release(poolreq.queueAgentID);
+                    poolreq.queueGuardTracked = false;
                 }
+
+                CompleteFairAssetRequest();
             }
         }
 
-        private static void HandleShowAssetPipeline(string module, string[] args)
-        {
-            MainConsole.Instance.Output(NovalythAssetPipelineMetrics.GetReport());
-        }
 
         private static void HandleResetAssetPipeline(string module, string[] args)
         {
             NovalythAssetPipelineMetrics.Reset();
             MainConsole.Instance.Output("[NOVALYTH] Asset pipeline metrics reset.");
+        }
+
+
+        private static void HandleShowAssetPipeline(string module, string[] args)
+        {
+            MainConsole.Instance.Output(NovalythAssetPipelineMetrics.GetReport());
         }
 
         private class PollServiceAssetEventArgs : PollServiceEventArgs
