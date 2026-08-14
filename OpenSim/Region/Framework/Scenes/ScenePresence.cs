@@ -131,6 +131,23 @@ namespace OpenSim.Region.Framework.Scenes
 
         private bool m_gotRegionHandShake = false;
 
+        // NOVALYTH APPEARANCE R2:
+        // A failed bake-cache validation during a real login is not immediately
+        // actionable because Firestorm may not have sent current bake texture IDs
+        // yet. Remember exactly one pending recovery and consume it atomically
+        // after the first viewer SetAppearance update.
+        private int m_novalythLoginBakeRecoveryPending = 0;
+
+        public void MarkNovalythLoginBakeRecoveryPending()
+        {
+            Interlocked.Exchange(ref m_novalythLoginBakeRecoveryPending, 1);
+        }
+
+        public bool TryConsumeNovalythLoginBakeRecovery()
+        {
+            return Interlocked.Exchange(ref m_novalythLoginBakeRecoveryPending, 0) != 0;
+        }
+
         private PresenceType m_presenceType;
         public PresenceType PresenceType
         {
@@ -2290,26 +2307,19 @@ namespace OpenSim.Region.Framework.Scenes
                         {
                             m_scene.AvatarFactory.QueueAppearanceSave(UUID);
 
-                            // NOVALYTH: OpenSim already knows that the baked appearance is
-                            // incomplete here.  On a real login, proactively ask the viewer
-                            // to rebuild only the baked textures that the simulator cannot
-                            // resolve.  Do not do this for ordinary region teleports.
+                            // NOVALYTH APPEARANCE R2:
+                            // At CompleteMovement Firestorm can still be several seconds away
+                            // from sending its current baked texture IDs. Do not issue a
+                            // guaranteed-empty rebake request here. Arm a one-shot recovery
+                            // that AvatarFactory consumes immediately after the viewer's first
+                            // SetAppearance update.
                             if ((m_teleportFlags & TeleportFlags.ViaLogin) != 0)
                             {
-                                int rebakesRequested = m_scene.AvatarFactory.RequestRebake(this, true);
+                                MarkNovalythLoginBakeRecoveryPending();
 
-                                if (rebakesRequested > 0)
-                                {
-                                    m_log.InfoFormat(
-                                        "[NOVALYTH APPEARANCE]: Incomplete baked texture cache for {0}; requested {1} missing-texture rebake(s) on login",
-                                        Name, rebakesRequested);
-                                }
-                                else
-                                {
-                                    m_log.DebugFormat(
-                                        "[NOVALYTH APPEARANCE]: Incomplete baked texture cache for {0}; no missing texture IDs were available for an automatic login rebake",
-                                        Name);
-                                }
+                                m_log.InfoFormat(
+                                    "[NOVALYTH APPEARANCE]: Incomplete baked texture cache for {0}; login recovery armed until first viewer appearance update",
+                                    Name);
                             }
                         }
                     }

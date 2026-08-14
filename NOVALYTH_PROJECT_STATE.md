@@ -1254,3 +1254,18 @@ Viewer validation:
 - log in normally with Firestorm without running a manual appearance command;
 - compare cloud duration with the previous approximately 20-second baseline;
 - confirm the NOVALYTH APPEARANCE runtime marker if the login cache is incomplete.
+
+## Appearance R2 – event-driven login bake recovery (20260814-081640)
+
+- Base commit: `bb3db4408c3f1c835fd2e28850567d27bc3969b6`
+- Trigger: invalid baked-texture cache detected during real `ViaLogin`.
+- CompleteMovement no longer depends on texture IDs being available immediately.
+- A one-shot pending recovery flag is armed on the ScenePresence.
+- The flag is atomically consumed by the first viewer `SetAppearance` update.
+- Bake cache is revalidated after the viewer supplied current texture IDs.
+- If still incomplete, Novalyth requests one full viewer rebake, equivalent to the working `appearance rebake` recovery path.
+- If already valid, no rebake is requested.
+- No sleeping worker/thread was added.
+- Ordinary teleports do not arm this recovery.
+- DEV Region only was restarted.
+- Asset Core, Inventory Core, DEV Robust and LIVE remained untouched.

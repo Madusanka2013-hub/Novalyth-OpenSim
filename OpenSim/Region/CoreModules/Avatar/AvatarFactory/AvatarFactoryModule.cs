@@ -1203,7 +1203,42 @@ namespace OpenSim.Region.CoreModules.Avatar.AvatarFactory
             // m_log.WarnFormat("[AVFACTORY]: Client_OnSetAppearance called for {0} ({1})", client.Name, client.AgentId);
             ScenePresence sp = m_scene.GetScenePresence(client.AgentId);
             if (sp != null)
+            {
                 SetAppearance(sp, textureEntry, visualParams, avSize, cacheItems);
+
+                // NOVALYTH APPEARANCE R2:
+                // CompleteMovement can detect an invalid bake before Firestorm has
+                // supplied usable texture IDs. The first SetAppearance is the earliest
+                // event-driven point where those IDs are actually available. Consume
+                // the login recovery exactly once, revalidate, and only then request
+                // the same full rebake that fixes a cloud via the console command.
+                if (sp.TryConsumeNovalythLoginBakeRecovery())
+                {
+                    if (ValidateBakedTextureCache(sp))
+                    {
+                        m_log.InfoFormat(
+                            "[NOVALYTH APPEARANCE R2]: Viewer appearance update repaired baked texture cache for {0}; no rebake needed",
+                            sp.Name);
+                    }
+                    else
+                    {
+                        int rebakesRequested = RequestRebake(sp, false);
+
+                        if (rebakesRequested > 0)
+                        {
+                            m_log.InfoFormat(
+                                "[NOVALYTH APPEARANCE R2]: Baked texture cache still incomplete for {0} after first viewer appearance update; requested {1} full rebake(s)",
+                                sp.Name, rebakesRequested);
+                        }
+                        else
+                        {
+                            m_log.WarnFormat(
+                                "[NOVALYTH APPEARANCE R2]: Baked texture cache still incomplete for {0}, but viewer supplied no usable bake texture IDs for recovery",
+                                sp.Name);
+                        }
+                    }
+                }
+            }
             else
                 m_log.WarnFormat("[AVFACTORY]: Client_OnSetAppearance unable to find presence for {0}", client.AgentId);
         }
