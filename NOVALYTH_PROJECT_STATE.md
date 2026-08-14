@@ -1577,3 +1577,37 @@ Viewer validation:
   C4B prewarm 11/11 -> atomic RAM-hot appearance publish.
 - Source/build/commit only. No runtime deploy, no restart, no INI mutation and no
   LIVE `/nvme/opensim` change are performed by this step.
+
+## Appearance C4D – nonblocking UpdateAvatarAppearance correctness
+
+Observed after C4C DEV validation:
+- Firestorm correctly negotiated SSA:
+  `RegionProtocols=0x8000000000000001`,
+  `supports_self_appearance=True`.
+- C4A received `UpdateAvatarAppearance`.
+- C4B successfully prewarmed 11/11 bakes in 16–44 ms.
+- Full server bake still took about 26–27 seconds.
+- During an in-flight bake, later `UpdateAvatarAppearance` requests repeatedly
+  hit the Region proxy's 5-second HTTP timeout.
+- Root cause: Appearance Core `HandleBakeBuild` held the same per-agent lock used
+  by the viewer update/control endpoint for the entire expensive bake.
+- A second correctness bug remained from C1: a valid `/update` still returned
+  `success=false`, `error=server_bake_not_active`, even though central baking is
+  now active. Official viewers treat `success=false` as an appearance failure.
+
+C4D changes:
+- Adds a separate per-agent bake lock for expensive bake execution.
+- `UpdateAvatarAppearance` no longer waits behind an active 2K bake.
+- Valid authoritative COF requests are acknowledged immediately with
+  `success=true`.
+- `/update` no longer performs a duplicate synchronous recipe build; the
+  asynchronous `/bake` request remains the single expensive build path.
+- State-file mutation after a bake uses the short state/control lock.
+- This allows the Region's C4A generation counter to advance while an older bake
+  is still running, so the existing stale-generation suppression can actually
+  prevent publishing an obsolete/half-changed outfit.
+- Performance work on the remaining ~26s bake latency is a subsequent phase;
+  C4D is primarily a correctness/transaction fix.
+
+Source/build/commit only. No runtime deploy, restart, INI mutation, Appearance
+Core restart, DEV region restart, or LIVE change in this step.

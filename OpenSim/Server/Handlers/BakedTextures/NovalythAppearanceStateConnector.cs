@@ -302,7 +302,13 @@ namespace Novalyth.Server.Appearance
         private readonly IInventoryService m_inventory;
         private readonly IAssetService m_assets;
 
+        // NOVALYTH APPEARANCE C4D
+        // Short state/control operations must never queue behind a 2K bake.
+        // A separate per-agent bake lock serializes expensive bake execution,
+        // while UpdateAvatarAppearance can acknowledge newer COF generations
+        // immediately so the Region can suppress stale results.
         private readonly ConcurrentDictionary<UUID, object> m_agentLocks = new();
+        private readonly ConcurrentDictionary<UUID, object> m_agentBakeLocks = new();
 
         public NovalythAppearanceStateHandler(
             string stateDirectory,
@@ -464,6 +470,11 @@ namespace Novalyth.Server.Appearance
         private object GetAgentLock(UUID agentID)
         {
             return m_agentLocks.GetOrAdd(agentID, _ => new object());
+        }
+
+        private object GetAgentBakeLock(UUID agentID)
+        {
+            return m_agentBakeLocks.GetOrAdd(agentID, _ => new object());
         }
 
         private string ShardedPath(string root, UUID agentID, string extension)
@@ -676,7 +687,9 @@ namespace Novalyth.Server.Appearance
 
         private void HandleBakeBuild(UUID agentID, IOSHttpResponse response)
         {
-            lock (GetAgentLock(agentID))
+            // C4D: serialize expensive bakes separately. Do NOT hold the short
+            // state/control lock for the full decode/composite/J2K duration.
+            lock (GetAgentBakeLock(agentID))
             {
                 if (!s_bakeConcurrency.Wait(TimeSpan.FromSeconds(120)))
                 {
@@ -764,13 +777,18 @@ namespace Novalyth.Server.Appearance
 
         private void UpdateStateFromManifest(UUID agentID, OSDMap manifest)
         {
-            AppearanceState state = LoadState(agentID);
-            state.CofVersion = manifest["cof_version"].AsInteger();
-            state.RecipeCofVersion = manifest["cof_version"].AsInteger();
-            state.RecipeHash = manifest["recipe_hash"].AsString();
-            state.ManifestStatus = manifest["status"].AsString();
-            state.UpdatedUtc = DateTime.UtcNow.ToString("O");
-            SaveState(agentID, state);
+            // C4D: state writes remain serialized with Increment/state requests,
+            // but this lock is held only for the tiny atomic state-file update.
+            lock (GetAgentLock(agentID))
+            {
+                AppearanceState state = LoadState(agentID);
+                state.CofVersion = manifest["cof_version"].AsInteger();
+                state.RecipeCofVersion = manifest["cof_version"].AsInteger();
+                state.RecipeHash = manifest["recipe_hash"].AsString();
+                state.ManifestStatus = manifest["status"].AsString();
+                state.UpdatedUtc = DateTime.UtcNow.ToString("O");
+                SaveState(agentID, state);
+            }
         }
 
         private bool TryReuseStoredBakes(OSDMap previous, OSDMap current)
@@ -2838,69 +2856,50 @@ namespace Novalyth.Server.Appearance
 
             int requested = cofOSD.AsInteger();
 
-            lock (GetAgentLock(agentID))
+            // NOVALYTH APPEARANCE C4D
+            // This endpoint is the viewer control plane, NOT the bake worker.
+            // It must return promptly even if the previous 2K bake is still
+            // compositing. The Region queues the expensive bake after this
+            // successful acknowledgement and tracks generations for stale
+            // suppression.
+            InventoryFolderBase cof = GetAuthoritativeCOF(agentID);
+            if (cof == null)
             {
-                InventoryFolderBase cof = GetAuthoritativeCOF(agentID);
-                if (cof == null)
-                {
-                    OSDMap fail = new();
-                    fail["success"] = false;
-                    fail["error"] = "cof_not_found";
-                    WriteMap(response, HttpStatusCode.OK, fail);
-                    return;
-                }
-
-                int authoritativeVersion = cof.Version;
-
-                if (requested != authoritativeVersion)
-                {
-                    OSDMap stale = new();
-                    stale["success"] = false;
-                    stale["error"] = "stale_cof_version";
-                    stale["expected"] = authoritativeVersion;
-                    stale["observed"] = requested;
-                    stale["version"] = authoritativeVersion;
-                    WriteMap(response, HttpStatusCode.OK, stale);
-                    return;
-                }
-
-                bool recipeReady =
-                    TryBuildAndPersistRecipe(
-                        agentID,
-                        out OSDMap manifest,
-                        out string recipeError);
-
-                AppearanceState state = LoadState(agentID);
-                state.CofVersion = authoritativeVersion;
-
-                if (recipeReady)
-                {
-                    state.RecipeHash = manifest["recipe_hash"].AsString();
-                    state.RecipeCofVersion = authoritativeVersion;
-                    state.ManifestStatus = manifest["status"].AsString();
-                }
-                else
-                {
-                    state.ManifestStatus = recipeError;
-                }
-
-                state.UpdatedUtc = DateTime.UtcNow.ToString("O");
-                SaveState(agentID, state);
-
-                // C1 deliberately never claims that pixels were baked.
-                OSDMap pending = new();
-                pending["success"] = false;
-                pending["error"] = "server_bake_not_active";
-                pending["expected"] = authoritativeVersion;
-                pending["version"] = authoritativeVersion;
-                pending["appearance_version"] = state.AppearanceVersion;
-                pending["recipe_ready"] = recipeReady;
-                pending["recipe_error"] = recipeError ?? string.Empty;
-                pending["recipe_hash"] = state.RecipeHash ?? string.Empty;
-                pending["bake_contract_version"] = m_bakeContractVersion;
-
-                WriteMap(response, HttpStatusCode.OK, pending);
+                OSDMap fail = new();
+                fail["success"] = false;
+                fail["error"] = "cof_not_found";
+                WriteMap(response, HttpStatusCode.OK, fail);
+                return;
             }
+
+            int authoritativeVersion = cof.Version;
+
+            if (requested != authoritativeVersion)
+            {
+                OSDMap stale = new();
+                stale["success"] = false;
+                stale["error"] = "stale_cof_version";
+                stale["expected"] = authoritativeVersion;
+                stale["observed"] = requested;
+                stale["version"] = authoritativeVersion;
+                WriteMap(response, HttpStatusCode.OK, stale);
+                return;
+            }
+
+            OSDMap accepted = new();
+            accepted["success"] = true;
+            accepted["version"] = authoritativeVersion;
+            accepted["expected"] = authoritativeVersion;
+            accepted["cof_authority"] = "Inventory Core";
+            accepted["server_bake"] = "accepted";
+            accepted["bake_contract_version"] = m_bakeContractVersion;
+
+            m_log.InfoFormat(
+                "[NOVALYTH APPEARANCE C4D]: UpdateAvatarAppearance accepted agent={0} cof={1}; expensive bake remains asynchronous",
+                agentID,
+                authoritativeVersion);
+
+            WriteMap(response, HttpStatusCode.OK, accepted);
         }
 
         private bool TryBuildAndPersistRecipe(
