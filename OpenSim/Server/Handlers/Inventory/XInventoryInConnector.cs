@@ -76,7 +76,26 @@ namespace OpenSim.Server.Handlers.Inventory
 
             IServiceAuth auth = ServiceAuth.Create(config, m_ConfigName);
 
-            server.AddStreamHandler(new XInventoryConnectorPostHandler(m_InventoryService, auth));
+            int coreMaxConcurrentRequests =
+                Math.Clamp(serverConfig.GetInt("CoreMaxConcurrentRequests", 0), 0, 512);
+            bool coreFairQueue =
+                serverConfig.GetBoolean("CoreFairQueue", true);
+
+            if (coreMaxConcurrentRequests > 0)
+            {
+                m_log.InfoFormat(
+                    "[NOVALYTH INVENTORY CORE]: admission max={0} fair-queue={1} rejection=none config={2}",
+                    coreMaxConcurrentRequests,
+                    coreFairQueue,
+                    m_ConfigName);
+            }
+
+            server.AddStreamHandler(
+                new XInventoryConnectorPostHandler(
+                    m_InventoryService,
+                    auth,
+                    coreMaxConcurrentRequests,
+                    coreFairQueue));
         }
     }
 
@@ -86,10 +105,31 @@ namespace OpenSim.Server.Handlers.Inventory
 
         private IInventoryService m_InventoryService;
 
+        private readonly InventoryCoreRequestGate m_CoreRequestGate;
+        private long m_CoreQueueWaits;
+        private int m_CoreQueueWaitLogOnce;
+
         public XInventoryConnectorPostHandler(IInventoryService service, IServiceAuth auth) :
+                this(service, auth, 0, true)
+        {
+        }
+
+        public XInventoryConnectorPostHandler(
+            IInventoryService service,
+            IServiceAuth auth,
+            int coreMaxConcurrentRequests,
+            bool coreFairQueue) :
                 base("POST", "/xinventory", auth)
         {
             m_InventoryService = service;
+
+            if (coreMaxConcurrentRequests > 0)
+            {
+                m_CoreRequestGate =
+                    new InventoryCoreRequestGate(
+                        coreMaxConcurrentRequests,
+                        coreFairQueue);
+            }
         }
 
         protected override byte[] ProcessRequest(string path, Stream requestData,
@@ -113,52 +153,87 @@ namespace OpenSim.Server.Handlers.Inventory
                 string method = request["METHOD"].ToString();
                 request.Remove("METHOD");
 
-                switch (method)
+                IDisposable coreLease = null;
+
+                try
                 {
-                    case "CREATEUSERINVENTORY":
-                        return HandleCreateUserInventory(request);
-                    case "GETINVENTORYSKELETON":
-                        return HandleGetInventorySkeleton(request);
-                    case "GETROOTFOLDER":
-                        return HandleGetRootFolder(request);
-                    case "GETFOLDERFORTYPE":
-                        return HandleGetFolderForType(request);
-                    case "GETFOLDERCONTENT":
-                        return HandleGetFolderContent(request);
-                    case "GETMULTIPLEFOLDERSCONTENT":
-                        return HandleGetMultipleFoldersContent(request);
-                    case "GETFOLDERITEMS":
-                        return HandleGetFolderItems(request);
-                    case "ADDFOLDER":
-                        return HandleAddFolder(request);
-                    case "UPDATEFOLDER":
-                        return HandleUpdateFolder(request);
-                    case "MOVEFOLDER":
-                        return HandleMoveFolder(request);
-                    case "DELETEFOLDERS":
-                        return HandleDeleteFolders(request);
-                    case "PURGEFOLDER":
-                        return HandlePurgeFolder(request);
-                    case "ADDITEM":
-                        return HandleAddItem(request);
-                    case "UPDATEITEM":
-                        return HandleUpdateItem(request);
-                    case "MOVEITEMS":
-                        return HandleMoveItems(request);
-                    case "DELETEITEMS":
-                        return HandleDeleteItems(request);
-                    case "GETITEM":
-                        return HandleGetItem(request);
-                    case "GETMULTIPLEITEMS":
-                        return HandleGetMultipleItems(request);
-                    case "GETFOLDER":
-                        return HandleGetFolder(request);
-                    case "GETACTIVEGESTURES":
-                        return HandleGetActiveGestures(request);
-                    case "GETASSETPERMISSIONS":
-                        return HandleGetAssetPermissions(request);
+                    if (m_CoreRequestGate != null)
+                    {
+                        string principalLane = GetPrincipalLane(request);
+
+                        coreLease = m_CoreRequestGate.Enter(
+                            principalLane,
+                            out bool queued,
+                            out int queueDepth);
+
+                        if (queued)
+                        {
+                            Interlocked.Increment(ref m_CoreQueueWaits);
+
+                            if (Interlocked.Exchange(ref m_CoreQueueWaitLogOnce, 1) == 0)
+                            {
+                                m_log.InfoFormat(
+                                    "[NOVALYTH INVENTORY CORE]: fair-queue WAIT; depth={0} lane={1} rejection=none",
+                                    queueDepth,
+                                    principalLane);
+                            }
+                        }
+                    }
+
+                    switch (method)
+                    {
+                        case "CREATEUSERINVENTORY":
+                            return HandleCreateUserInventory(request);
+                        case "GETINVENTORYSKELETON":
+                            return HandleGetInventorySkeleton(request);
+                        case "GETROOTFOLDER":
+                            return HandleGetRootFolder(request);
+                        case "GETFOLDERFORTYPE":
+                            return HandleGetFolderForType(request);
+                        case "GETFOLDERCONTENT":
+                            return HandleGetFolderContent(request);
+                        case "GETMULTIPLEFOLDERSCONTENT":
+                            return HandleGetMultipleFoldersContent(request);
+                        case "GETFOLDERITEMS":
+                            return HandleGetFolderItems(request);
+                        case "ADDFOLDER":
+                            return HandleAddFolder(request);
+                        case "UPDATEFOLDER":
+                            return HandleUpdateFolder(request);
+                        case "MOVEFOLDER":
+                            return HandleMoveFolder(request);
+                        case "DELETEFOLDERS":
+                            return HandleDeleteFolders(request);
+                        case "PURGEFOLDER":
+                            return HandlePurgeFolder(request);
+                        case "ADDITEM":
+                            return HandleAddItem(request);
+                        case "UPDATEITEM":
+                            return HandleUpdateItem(request);
+                        case "MOVEITEMS":
+                            return HandleMoveItems(request);
+                        case "DELETEITEMS":
+                            return HandleDeleteItems(request);
+                        case "GETITEM":
+                            return HandleGetItem(request);
+                        case "GETMULTIPLEITEMS":
+                            return HandleGetMultipleItems(request);
+                        case "GETFOLDER":
+                            return HandleGetFolder(request);
+                        case "GETACTIVEGESTURES":
+                            return HandleGetActiveGestures(request);
+                        case "GETASSETPERMISSIONS":
+                            return HandleGetAssetPermissions(request);
+                    }
+
+                    m_log.DebugFormat(
+                        "[XINVENTORY HANDLER]: unknown method request: {0}",
+                        method);
                 }
-                m_log.DebugFormat("[XINVENTORY HANDLER]: unknown method request: {0}", method);
+                finally
+                {
+                    coreLease?.Dispose();
+                }
             }
             catch (Exception e)
             {
@@ -166,6 +241,176 @@ namespace OpenSim.Server.Handlers.Inventory
             }
 
             return FailureResult();
+        }
+
+        private static string GetPrincipalLane(
+            Dictionary<string, object> request)
+        {
+            string[] keys =
+            [
+                "PRINCIPAL",
+                "Owner",
+                "OWNER",
+                "owner",
+                "AgentID",
+                "agentID",
+                "AvatarID",
+                "avatarID"
+            ];
+
+            foreach (string key in keys)
+            {
+                if (request.TryGetValue(key, out object value)
+                    && UUID.TryParse(value?.ToString(), out UUID principalID))
+                {
+                    return principalID.ToString();
+                }
+            }
+
+            return "__system__";
+        }
+
+        private sealed class InventoryCoreRequestGate
+        {
+            private readonly object m_Sync = new();
+            private readonly int m_MaxActive;
+            private readonly bool m_Fair;
+
+            private readonly Dictionary<string, Queue<GateWaiter>> m_Lanes = new();
+            private readonly Queue<string> m_RoundRobin = new();
+
+            private int m_Active;
+            private int m_Waiting;
+
+            public InventoryCoreRequestGate(int maxActive, bool fair)
+            {
+                m_MaxActive = Math.Max(1, maxActive);
+                m_Fair = fair;
+            }
+
+            public IDisposable Enter(
+                string principalLane,
+                out bool queued,
+                out int queueDepth)
+            {
+                principalLane =
+                    string.IsNullOrEmpty(principalLane)
+                        ? "__system__"
+                        : principalLane;
+
+                GateWaiter waiter;
+
+                lock (m_Sync)
+                {
+                    // Existing queued work always has priority over new
+                    // arrivals, even if a slot becomes free momentarily.
+                    if (m_Active < m_MaxActive && m_Waiting == 0)
+                    {
+                        m_Active++;
+                        queued = false;
+                        queueDepth = 0;
+                        return new GateLease(this);
+                    }
+
+                    string lane =
+                        m_Fair
+                            ? principalLane
+                            : "__fifo__";
+
+                    if (!m_Lanes.TryGetValue(
+                            lane,
+                            out Queue<GateWaiter> laneQueue))
+                    {
+                        laneQueue = new Queue<GateWaiter>();
+                        m_Lanes[lane] = laneQueue;
+                        m_RoundRobin.Enqueue(lane);
+                    }
+
+                    waiter = new GateWaiter();
+                    laneQueue.Enqueue(waiter);
+                    m_Waiting++;
+
+                    queued = true;
+                    queueDepth = m_Waiting;
+                }
+
+                waiter.Signal.Wait();
+                waiter.Signal.Dispose();
+
+                return new GateLease(this);
+            }
+
+            private void Exit()
+            {
+                List<GateWaiter> wake = null;
+
+                lock (m_Sync)
+                {
+                    if (m_Active > 0)
+                        m_Active--;
+
+                    while (m_Active < m_MaxActive
+                        && m_RoundRobin.Count > 0)
+                    {
+                        string lane = m_RoundRobin.Dequeue();
+
+                        if (!m_Lanes.TryGetValue(
+                                lane,
+                                out Queue<GateWaiter> laneQueue)
+                            || laneQueue.Count == 0)
+                        {
+                            m_Lanes.Remove(lane);
+                            continue;
+                        }
+
+                        GateWaiter waiter = laneQueue.Dequeue();
+
+                        m_Waiting--;
+                        m_Active++;
+
+                        if (laneQueue.Count > 0)
+                            m_RoundRobin.Enqueue(lane);
+                        else
+                            m_Lanes.Remove(lane);
+
+                        wake ??= [];
+                        wake.Add(waiter);
+                    }
+                }
+
+                if (wake == null)
+                    return;
+
+                foreach (GateWaiter waiter in wake)
+                    waiter.Signal.Set();
+            }
+
+            private sealed class GateWaiter
+            {
+                public readonly ManualResetEventSlim Signal =
+                    new(false);
+            }
+
+            private sealed class GateLease : IDisposable
+            {
+                private InventoryCoreRequestGate m_Owner;
+
+                public GateLease(
+                    InventoryCoreRequestGate owner)
+                {
+                    m_Owner = owner;
+                }
+
+                public void Dispose()
+                {
+                    InventoryCoreRequestGate owner =
+                        Interlocked.Exchange(
+                            ref m_Owner,
+                            null);
+
+                    owner?.Exit();
+                }
+            }
         }
 
         private byte[] FailureResult()

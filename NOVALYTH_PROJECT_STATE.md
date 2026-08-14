@@ -1046,3 +1046,62 @@ Next:
 - inspect Inventory Core incoming execution model before changing worker counts;
 - add queue/latency telemetry only where it can guide tuning without changing
   request semantics.
+
+## R2 Inventory Performance – Core Execution Model + Admission
+
+Status: **DEV RUNTIME VALIDATED**
+
+Date: 2026-08-14
+
+Execution-model audit:
+
+- `XInventoryInConnector` is a synchronous `BaseStreamHandler`;
+- OpenSim's HTTP listener accepts connections asynchronously;
+- each `HttpClientContext` starts an async receive task;
+- completed requests invoke the registered HTTP handler directly in that
+  connection request context;
+- there is no dedicated Inventory worker-pool setting that should simply be
+  increased;
+- adding another Inventory worker pool would duplicate scheduling layers and
+  was deliberately rejected.
+
+Core admission implementation:
+
+- Inventory Core `8120` now has a central admission gate before Inventory
+  service dispatch;
+- global maximum active Inventory requests: `32`;
+- queued requests are grouped by principal and dispatched round-robin;
+- requests with no resolvable principal use a system lane;
+- existing queued work cannot be bypassed by new arrivals;
+- no request rejection path exists;
+- the gate is disabled by default and enabled only in dedicated
+  `Robust.Inventory.ini`;
+- main Robust/private/public proxy handlers therefore retain normal handler
+  semantics unless explicitly configured.
+
+Validation:
+
+- full solution build passed before runtime deployment;
+- `OpenSim.Server.Handlers.dll` contains the core admission implementation;
+- only Inventory Core was restarted;
+- startup confirmed central admission configuration;
+- pre/post `GETROOTFOLDER` response was byte-identical;
+- 128 parallel direct-core functional requests returned HTTP 200;
+- runtime core queue observation: `NOT_OBSERVED_NONBLOCKING`;
+- Asset Core, DEV Robust and DEV Region were not restarted;
+- LIVE `/nvme/opensim` remained untouched.
+
+Current R2 Inventory layers:
+
+1. exclusive Inventory Core DB ownership;
+2. native multi-folder DB batching;
+3. short-lived remote folder cache;
+4. remote request coalescing;
+5. per-process remote bounded concurrency + principal fairness;
+6. central Inventory Core bounded admission + global principal fairness.
+
+Next:
+
+- no blind worker-count tuning;
+- perform targeted Inventory method/path audit for remaining N+1 DB patterns,
+  especially skeleton/type/item lookup and mutation-side redundant reads.
