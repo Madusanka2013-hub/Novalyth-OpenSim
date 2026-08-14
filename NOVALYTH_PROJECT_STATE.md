@@ -1209,3 +1209,48 @@ Next:
 - introduce a bulk mutation capability for MoveItems/DeleteItems so multi-item
   operations share one transaction instead of one transaction per item;
 - preserve AllowDelete/link-only behavior when batching deletes.
+
+## Appearance – Automatic Login Rebake for Incomplete Bakes
+
+Status: **DEV DEPLOYED – VIEWER VALIDATION PENDING**
+
+Date: 2026-08-14
+
+Observed real-world symptom:
+
+- a local user could remain a cloud for roughly 20 seconds after login;
+- the manual `appearance rebake <first> <last>` command immediately repaired the appearance;
+- normal inventory operations and the separated Inventory/Asset cores remained functional.
+
+Upstream behavior:
+
+- during `ScenePresence.CompleteMovement`, OpenSim validates the baked texture cache;
+- when validation fails, upstream only queues an appearance save;
+- it does not proactively request a viewer rebake at that login point.
+
+NOVALYTH change:
+
+- preserve the existing baked-cache validation and appearance-save behavior;
+- if validation is incomplete and the arrival has the `ViaLogin` flag, request
+  a rebake for **missing textures only** through the existing
+  `IAvatarFactoryModule.RequestRebake()` path;
+- ordinary region teleports are not changed;
+- Hypergrid TP behavior remains excluded by the existing `!isHGTP` condition;
+- no new worker pool or background service was introduced.
+
+Runtime marker:
+
+`[NOVALYTH APPEARANCE]: Incomplete baked texture cache ... requested ... missing-texture rebake(s) on login`
+
+Deployment:
+
+- only `OpenSim.Region.Framework.dll` in the DEV region runtime is replaced;
+- only DEV Region is restarted;
+- DEV Robust, Inventory Core and Asset Core remain untouched;
+- LIVE `/nvme/opensim` remains untouched.
+
+Viewer validation:
+
+- log in normally with Firestorm without running a manual appearance command;
+- compare cloud duration with the previous approximately 20-second baseline;
+- confirm the NOVALYTH APPEARANCE runtime marker if the login cache is incomplete.

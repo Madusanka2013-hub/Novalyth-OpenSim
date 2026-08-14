@@ -2287,7 +2287,31 @@ namespace OpenSim.Region.Framework.Scenes
                     if (m_scene.AvatarFactory != null && !isHGTP)
                     {
                         if (!m_scene.AvatarFactory.ValidateBakedTextureCache(this))
+                        {
                             m_scene.AvatarFactory.QueueAppearanceSave(UUID);
+
+                            // NOVALYTH: OpenSim already knows that the baked appearance is
+                            // incomplete here.  On a real login, proactively ask the viewer
+                            // to rebuild only the baked textures that the simulator cannot
+                            // resolve.  Do not do this for ordinary region teleports.
+                            if ((m_teleportFlags & TeleportFlags.ViaLogin) != 0)
+                            {
+                                int rebakesRequested = m_scene.AvatarFactory.RequestRebake(this, true);
+
+                                if (rebakesRequested > 0)
+                                {
+                                    m_log.InfoFormat(
+                                        "[NOVALYTH APPEARANCE]: Incomplete baked texture cache for {0}; requested {1} missing-texture rebake(s) on login",
+                                        Name, rebakesRequested);
+                                }
+                                else
+                                {
+                                    m_log.DebugFormat(
+                                        "[NOVALYTH APPEARANCE]: Incomplete baked texture cache for {0}; no missing texture IDs were available for an automatic login rebake",
+                                        Name);
+                                }
+                            }
+                        }
                     }
                 }
 
