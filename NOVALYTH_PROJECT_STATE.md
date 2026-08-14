@@ -872,3 +872,42 @@ Next:
 
 - practical inventory open/move/rez sanity check;
 - then Inventory Phase B for exclusive Inventory DB ownership.
+
+## R2 Inventory Service Split – Phase B
+
+Status: **DEV RUNTIME VALIDATED / VIEWER SANITY PENDING**
+
+Date: 2026-08-14
+
+Architecture:
+
+- dedicated Inventory Core `127.0.0.1:8120` is the exclusive Inventory DB owner;
+- DEV Region inventory -> Inventory Core 8120;
+- main Robust `[InventoryService]` is a remote XInventoryServicesConnector to 8120;
+- private Robust `8103/xinventory` remains as a compatibility proxy to 8120;
+- LoginService inventory -> remote XInventoryServicesConnector;
+- UserAccountService inventory -> remote XInventoryServicesConnector;
+- public HG `8102/xinventory` keeps suitcase policy through
+  `RemoteHGSuitcaseInventoryService` in OpenSim.Services.Connectors.dll;
+- RemoteHGSuitcaseInventoryService delegates storage to 8120 and contains no
+  IXInventoryData/database provider;
+- Asset Core Phase B remains unchanged on 8110;
+- LIVE `/nvme/opensim` unchanged.
+
+Validation:
+
+- test principal `0f81b41d-75f2-4e6d-b751-0fd0ef64da2d`;
+- Inventory Core 8120 GETROOTFOLDER: HTTP 200;
+- private Robust proxy 8103 GETROOTFOLDER: byte-identical to 8120;
+- public HG 8102 GETROOTFOLDER: HTTP 200 and rooted at `My Suitcase`;
+- fresh main Robust startup contains the Novalyth remote-suitcase backing marker;
+- fresh main Robust startup contains no InventoryStore migration marker;
+- main Robust config contains zero active direct
+  `OpenSim.Services.InventoryService.dll:XInventoryService` references;
+- DEV Region restarted with TCP+UDP 9100;
+- optional RegionReady marker is not used as a readiness condition.
+
+Next:
+
+- Firestorm login + inventory read/write/rez sanity check;
+- then continue R2 inventory performance work: true batching, worker tuning, cache.
