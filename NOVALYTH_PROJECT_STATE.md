@@ -831,3 +831,44 @@ Deferred:
 
 - Stage-2 `caps pending` and fair-queue wait telemetry cleanup is recorded as a
   metrics TODO and is not a blocker for the service split.
+
+## R2 Inventory Service Split – Phase A
+
+Status: **DEV VALIDATED + VIEWER LOGIN VALIDATED**
+
+Date: 2026-08-14
+
+Architecture:
+
+- dedicated Inventory Core process on `127.0.0.1:8120`;
+- endpoint: `http://127.0.0.1:8120/xinventory`;
+- local service: `OpenSim.Services.InventoryService.dll:XInventoryService`;
+- storage: existing `novalyth_robust_dev` inventory tables;
+- DEV Region InventoryServerURI -> `http://127.0.0.1:8120`;
+- main DEV Robust/HG inventory remains unchanged in Phase A;
+- Asset Core Phase B remains unchanged;
+- LIVE `/nvme/opensim` unchanged.
+
+Validation:
+
+- test principal `bc699768-fb51-4dc7-a9b5-3b1edef31e4f`;
+- existing Robust 8103/xinventory and Inventory Core 8120/xinventory
+  return byte-identical GETROOTFOLDER responses;
+- XInventoryInConnector startup is explicitly verified by
+  `XInventoryInConnector loaded successfully`;
+- DEV Region runs with TCP+UDP 9100 after cutover;
+- Firestorm login succeeded after the InventoryServerURI cutover;
+- avatar left cloud state immediately and scene textures were immediately visible;
+- the optional RegionReady log marker is not used as a hard readiness condition.
+
+Installer fixes learned:
+
+- port LISTEN is not equivalent to service ready;
+- wait for the connector-specific loaded marker before service smoke tests;
+- `INITIALIZATION COMPLETE ... LOGINS ENABLED` belongs to optional RegionReady
+  behavior and must not be mandatory for generic region readiness.
+
+Next:
+
+- practical inventory open/move/rez sanity check;
+- then Inventory Phase B for exclusive Inventory DB ownership.
